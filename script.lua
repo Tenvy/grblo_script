@@ -5243,6 +5243,9 @@ do
 		end
 	end
 	function rot.set(phase, world)
+		if world and world ~= cfg.run.statW then -- a world's round starts: time + gems for the webhook (rot.report)
+			cfg.run.statW, cfg.run.t0, cfg.run.g0, cfg.run.left = world, os.time(), fb.gemsNow(), nil
+		end
 		cfg.run.phase, cfg.run.world, cfg.run.pin = phase, world or cfg.run.world, nil
 		rot.ran, rot.moved, rot.doneAt, rot.spotFails, rot.bad, rot.retries, rot.hvLeft = nil, 0, nil, 0, {}, 0, nil
 		rot.save()
@@ -5554,7 +5557,33 @@ do
 		end
 		rot.save()
 	end
+	-- Discord webhook when a world's round ends: how long it took, seeds that didn't fit (bag + dropped
+	-- here at the last plant's end), gems gained (the HUD's gem count, local: never GetGems).
+	-- Sent with the executor's request() (Delta / Opiumware: `request`), in the background.
+	function rot.report(F)
+		local url = cfg.webhook or ""
+		if not url:match("^https://discord%.com/api/webhooks/") and not url:match("^https://discordapp%.com/api/webhooks/") then return end
+		local req = (syn and syn.request) or (http and http.request) or http_request or request
+		if not req then return end
+		local P, R = rot.per(F), cfg.run
+		local secs = R.t0 and os.time() - R.t0
+		local g1 = fb.gemsNow()
+		local seed = P.seed and itemDB[P.seed] and itemDB[P.seed].name or "?"
+		local ready = P.ready and P.ready - workspace:GetServerTimeNow()
+		local fields = {
+			{ name = "Time", value = secs and string.format("%dh %02dm (done %s)", secs // 3600, secs % 3600 // 60, os.date("%H:%M")) or "?", inline = true },
+			{ name = "Seeds not planted (full)", value = R.left and string.format("~%d %s", R.left, seed) or "?", inline = true },
+			{ name = "Gems", value = (g1 and R.g0) and string.format("+%d", math.max(0, g1 - R.g0)) or "?", inline = true },
+			{ name = "Next ripe", value = ready and ready > 0 and rot.fmt(ready) or "-", inline = true },
+		}
+		local body = game:GetService("HttpService"):JSONEncode({ embeds = { {
+			title = "Done · " .. F, description = seed .. " · " .. players.LocalPlayer.Name, color = 0x57F287, fields = fields,
+		} } })
+		task.spawn(pcall, req, { Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+	end
 	function rot.finish(F)
+		pcall(rot.report, F)
+		cfg.run.statW = nil -- the next round here starts a new count
 		cfg.run.last, cfg.run.more = F, nil
 		rot.set("wait")
 		rot.say("done with " .. F)
@@ -5859,6 +5888,11 @@ do
 			if not (m:find("^done") or m:find("^out of")) then return rot.ended("Auto Plant", m) end
 			local _, ready = rot.scan(w) -- back when the last one is ripe
 			P.ready = ready > 0 and ready or workspace:GetServerTimeNow() + 1800
+			local left = fb.inv:count(P.seed) -- seeds that didn't fit: bag + dropped here (webhook)
+			for _, d in ipairs(fb.drops) do
+				if d.id == P.seed and d.uid and not d.pending then left += d.n end
+			end
+			cfg.run.left = left
 			if state.NoDrop then
 				P.plantFull = m:find("^done") and fb.inv:count(P.seed) > 0 or nil -- seeds left = no free spot
 				return rot.noDropNext(w)
@@ -6524,6 +6558,20 @@ do
 		cfg.whitelist = rot.G.box.Text
 		rot.G.parse()
 		rot.save()
+	end)
+	makeSection(rot.page, "Discord webhook (a world's round done)", 25)
+	rot.hookBox = makeSearchBox(rot.page, "https://discord.com/api/webhooks/...", 26)
+	rot.hookBox.Text = cfg.webhook or ""
+	rot.hookBox.FocusLost:Connect(function()
+		cfg.webhook = rot.hookBox.Text:gsub("%s", "")
+		rot.hookBox.Text = cfg.webhook
+		rot.save()
+	end)
+	makeButton(rot.page, "Send a test (this world's numbers so far)", 27, function()
+		local F = cfg.run.world or (fb.world and fb.world.name) or "?"
+		if not (cfg.webhook or ""):match("^https://discord") then return rot.say("paste a Discord webhook URL first") end
+		rot.report(F)
+		rot.say("webhook test sent · " .. F)
 	end)
 
 	-- Settings from the last run (= clicking each switch), then Auto Rotate again if it was on in
