@@ -5326,12 +5326,16 @@ end
 -- rotation; server rejects = a 1-2 min cool-down (see rot.ended); a humanizer session end = a 1-2
 -- min rest, then it goes on.
 do
-	local rot = { FILE = "growblox_auto.json", FRESH = 900, page = pages.Rotate, bad = {}, loading = true,
+	-- one settings file per account: 2 clients on one PC share the workspace folder
+	local rot = { FILE = "growblox_auto_" .. players.LocalPlayer.Name .. ".json", FRESH = 900, page = pages.Rotate, bad = {}, loading = true,
 		COOL = { { 60, 120 }, { 180, 300 }, { 300, 480 } }, -- s of cool-down after the 1st / 2nd / 3rd reject stop in 30 min
 		SETTINGS = { "FastBreak", "BreakWalk", "FarmFetch", "FarmDrop", "RowFetch", "RowDrop", "RotRow", "PathLeave", "Humanize", "HumanPauses", "PlantBurst", "DoorHover", "DoorTags", "UltimateFPS", "BlankScreen", "AntiIdle", "DropWall", "NoDrop", "Guard", "FarmTop" },
 		MODES = { "AutoBreak", "AutoCollect", "AutoFarm", "AutoHarvest", "AutoPlant", "RowFarm" } } -- RowFarm: only switched off (Rotate drives the bot)
 	local cfg = (function()
 		local ok, c = pcall(function() return game:GetService("HttpService"):JSONDecode(readfile(rot.FILE)) end)
+		if not ok then -- first run on this account: start from the old shared file
+			ok, c = pcall(function() return game:GetService("HttpService"):JSONDecode(readfile("growblox_auto.json")) end)
+		end
 		return ok and type(c) == "table" and c or {}
 	end)()
 	cfg.worlds, cfg.storage, cfg.per = cfg.worlds or {}, cfg.storage or "", cfg.per or {}
@@ -5443,7 +5447,7 @@ do
 
 	-- Timeline of world changes / closes / stops (growblox_rotate_log.json, last 300): a teleport's
 	-- length = "loaded" time minus "teleport" time.
-	rot.LOG = "growblox_rotate_log.json"
+	rot.LOG = "growblox_rotate_log_" .. players.LocalPlayer.Name .. ".json"
 	fb.rotLog = fb.rotLog or (function()
 		local ok, l = pcall(function() return game:GetService("HttpService"):JSONDecode(readfile(rot.LOG)) end)
 		return ok and type(l) == "table" and l or {}
