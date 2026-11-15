@@ -640,6 +640,7 @@ fb.gemsNow()
 
 fb.collected = fb.collected or 0
 fb.dropSkip = {} -- uid -> os.clock() until which we leave it alone
+fb.fullTiles = fb.fullTiles or {} -- "world:x,y" pile tiles the server called full
 fb.farmSeeds = fb.farmSeeds or {} -- seed ids of blocks Auto Farm placed (Auto Drop watches these)
 
 -- Our stashes (Auto Farm's seed pile, Auto Harvest's drop spot): never pull them back in. A stash
@@ -3400,7 +3401,7 @@ local function dropSpot()
 	SIM.solid = {}
 	local sp = fb.dropSpot
 	if sp and sp.world == fb.world.name and spotFits(sp.x, sp.y, sp.dir) then return sp end
-	fb.dropSpot = findSpot(fb.farmHome, 5)
+	fb.dropSpot = findSpot(fb.farmHome, 5, function(x, y) return fb.fullTiles[fb.world.name .. ":" .. x .. "," .. y] end)
 	return fb.dropSpot
 end
 
@@ -3462,6 +3463,7 @@ local function dropStack(sp, ids, mode, key, mix)
 		end
 		if not (full or refused) then return nil, total end
 		if fb.rlog then fb.rlog("drop refused", string.format("%s @ %d,%d in %s", tostring(refused or "full"), x + sp.dir, sp.y, fb.world.name)) end
+		fb.fullTiles[fb.world.name .. ":" .. (x + sp.dir) .. "," .. sp.y] = true -- the next stash search skips it
 		if not spotFits(x + sp.dir, sp.y, sp.dir) then
 			return refused and ("the game won't drop " .. refused .. " here · set a new drop spot") or "drop spot full · set a new one", total
 		end
@@ -3470,13 +3472,19 @@ local function dropStack(sp, ids, mode, key, mix)
 	return "drop spot full · set a new one", total
 end
 
+-- Stash full (piles from earlier rounds fill a tile up): forget it, try the next free spot, up to 3.
 local function dropSeeds(sd)
 	local name = itemDB[sd].name
-	local sp = dropSpot()
-	if not sp then return "no spot 5+ tiles away to drop " .. name end
-	fb.farmStatus = string.format("dropping %s @ %d,%d", name, sp.x + sp.dir, sp.y)
-	local err, n = dropStack(sp, { sd })
-	fb.seedsDropped = (fb.seedsDropped or 0) + n
+	local err, n
+	for _ = 1, 3 do
+		local sp = dropSpot()
+		if not sp then return err or ("no spot 5+ tiles away to drop " .. name) end
+		fb.farmStatus = string.format("dropping %s @ %d,%d", name, sp.x + sp.dir, sp.y)
+		err, n = dropStack(sp, { sd })
+		fb.seedsDropped = (fb.seedsDropped or 0) + n
+		if not (err and err:find("set a new")) or fb.inv:count(sd) == 0 then return nil end
+		fb.dropSpot = nil
+	end
 	return err
 end
 
@@ -3498,16 +3506,24 @@ farmTrip = function(trip)
 		if fb.inv:count(trip.fetch) == 0 then fb.dropSkip[pile.uid] = os.clock() + 30 end -- try another pile next
 	else
 		err = dropSeeds(trip.drop)
-		if err then
+		-- lag / a missed walk: try again in 20s (twice); a spot problem: auto drop off
+		if err and not (err:find("set a new") or err:find("^no spot")) and (fb.dropFails or 0) < 2 then
+			fb.dropFails = (fb.dropFails or 0) + 1
+			fb.tripRetryAt = os.clock() + 20
+			err = err .. " · retry in 20s"
+		elseif err then
 			state.FarmDrop = false
 			renderDropToggle()
+			err = err .. " · auto drop off"
+		else
+			fb.dropFails = 0
 		end
 	end
 	if not state.AutoFarm then return end
 	local home = (fb.pullbacks or 0) == pulls and goHome()
 	if (fb.pullbacks or 0) > pulls then return stopFarm("server pulled you back · stopped") end
 	if not home then return stopFarm("couldn't get back to the farm · stopped") end
-	fb.farmStatus = err and (err .. " · auto drop off") or nil
+	fb.farmStatus = err
 end
 
 -- ===== Row Farm: walk out placing a row (a wall behind you), walk back breaking it =====
