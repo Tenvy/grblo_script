@@ -6320,6 +6320,7 @@ do
 	-- piles 2+ tiles from the door (rot.dropAll: a full tile -> the next tile out, then a new spot).
 	-- Then back to supply while piles are left there; none left = done, Auto Drop goes off.
 	rot.D = { page = pages["Auto Drop"], skip = {} } -- skip: "x,y:id" -> os.clock() until (box refused / no way)
+	fb.rot = rot -- handle for live checks (MCP)
 	function rot.D.carry()
 		local n = 0
 		for _, id in ipairs(cfg.drop.items) do n += fb.inv:count(id) end
@@ -6392,7 +6393,8 @@ do
 			local st = fb.player.state()
 			local ok = (st.facing or 0) * dir > 0 and math.floor(st.x + dir * 0.7) == tx and math.floor(st.x + dir * 0.8) == tx
 			if box then
-				local bx, by = w.displayHere and w.displayHere(st.x + dir * 0.75)
+				local bx, by -- not `w.displayHere and w.displayHere(...)`: `and` keeps only the 1st return
+				if w.displayHere then bx, by = w.displayHere(st.x + dir * 0.75) end
 				ok = ok and bx == tx and by == ty
 			end
 			if ok then return true end
@@ -6475,7 +6477,8 @@ do
 			rot.log("dirt wall", string.format("new wall @ %d,%d in %s", wl.x, wl.y, w.name))
 		end
 		local tx, ty, sx, dir = D.slot(wl, wl.i)
-		local ux, uy = (wl.i % 20 == 0) and D.support(wl, wl.i // 20 + 1)
+		local ux, uy
+		if wl.i % 20 == 0 then ux, uy = D.support(wl, wl.i // 20 + 1) end -- (`and` would drop uy)
 		ux = ux and w.fg[uy] and w.fg[uy][ux] == 0 and ux or nil
 		if fb.inv:count(D.DIRT) < (ux and 2 or 1) then return rot.stop("out of Dirt · put Dirt in your bag") end
 		local name = itemDB[id] and itemDB[id].name or "?"
