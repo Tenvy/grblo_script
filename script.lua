@@ -6338,8 +6338,9 @@ do
 		for y, row in pairs(w.fg) do
 			for x, tid in pairs(row) do
 				local it = tid ~= 0 and itemDB[tid]
-				if it and it.display and not it.displayOne and (rot.D.skip[x .. "," .. y .. ":" .. id] or 0) < now
-					and w.areas.canEdit(x, y) then
+				-- no access check: anyone can drop into a box (the game's displayPut asks the server;
+				-- only the owner takes items out). A refused box = skipped 10 min (rot.D.store / intoBox).
+				if it and it.display and not it.displayOne and (rot.D.skip[x .. "," .. y .. ":" .. id] or 0) < now then
 					local mine, other = false, false
 					for _, c in pairs(w.displays and w.displays.get(x, y) or {}) do
 						if type(c) == "table" and c[1] == id then mine = true else other = true end
