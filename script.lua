@@ -5693,7 +5693,10 @@ do
 		if not (sp and spotFits(sp.x + sp.dir * ((sp.n or 1) - 1), sp.y, sp.dir)) then
 			local rx, ry = fb.hv.respawnTile(fb.world)
 			sp = rx and findSpot({ x = rx, y = ry }, 2, function(x, y) return P.fulls[x .. "," .. y] end)
-			if not sp then return rot.stop("storage full near the door in " .. S .. " · clear some piles") end
+			if not sp then
+				return rot.stop(next(P.fulls) and ("storage full near the door in " .. S .. " · clear some piles")
+					or ("nowhere to drop near the door in " .. S .. " (walls, display boxes full) · use another storage world"))
+			end
 			P.spots[sk] = sp
 		end
 		rot.say(string.format("dropping %s ×%d @ %d,%d", itemDB[seed].name, fb.inv:count(seed), sp.x + sp.dir, sp.y))
@@ -6096,7 +6099,10 @@ do
 			if n == 0 then return rot.finish(F) end
 			return rot.go(S)
 		end
-		if here == S and n > 0 then return rot.dropAll(seed) end
+		if here == S and n > 0 then -- display boxes first (like Auto Drop), then floor piles
+			if rot.D.intoBox(seed, "AutoRotate") then return end
+			return rot.dropAll(seed)
+		end
 		if n > 0 then return rot.go(S) end
 		if cfg.run.more then return rot.go(F) end
 		rot.finish(F)
@@ -6350,7 +6356,8 @@ do
 	-- Stand beside box b, face it, drop the whole stack: the game's onDrop sees the box in front
 	-- (displayHere) and puts it in (displayPut -> DisplayItem); refused = the stack comes back.
 	-- nil = in, else why not.
-	function rot.D.toBox(w, b, id)
+	function rot.D.toBox(w, b, id, key)
+		key = key or "AutoDrop"
 		SIM.solid = {}
 		local s = fb.player.state()
 		local sx, sy = nodeOf(s.x, s.y)
@@ -6360,8 +6367,8 @@ do
 			if sx and standable(b.x - d, b.y) and planPath(sx, sy, b.x - d + 0.5, b.y + 0.5, { exact = true }) then dir = d break end
 		end
 		if not dir then return "no way to it" end
-		runBot({ x = b.x - dir + 0.5, y = b.y + 0.5, tile = true, exact = true }, "collect", "AutoDrop")
-		if not (state.AutoDrop and snapTo(b.x - dir, b.y)) then return "couldn't reach it" end
+		runBot({ x = b.x - dir + 0.5, y = b.y + 0.5, tile = true, exact = true }, "collect", key)
+		if not (state[key] and snapTo(b.x - dir, b.y)) then return "couldn't reach it" end
 		if not rot.D.face(w, dir, b.x, b.y, true) then return "couldn't line up with it" end -- never on the floor instead
 		local n, had = fb.inv:count(id), rot.D.amount(w, b.x, b.y, id)
 		task.wait(0.35) -- the game's "Slow down!" gap
@@ -6508,22 +6515,26 @@ do
 		rot.save()
 	end
 
+	-- The whole stack of id into a display box here (Auto Drop / Auto Rotate's storage). true = in
+	-- (or the toggle went off: the caller just returns), nil = no box took it -> the floor.
+	function rot.D.intoBox(id, key)
+		local w, name = fb.world, itemDB[id] and itemDB[id].name or "?"
+		for _, b in ipairs(rot.D.boxes(w, id)) do
+			rot.say(string.format("display box @ %d,%d · %s ×%d", b.x, b.y, name, fb.inv:count(id)))
+			local err = rot.D.toBox(w, b, id, key)
+			if not state[key] then return true end
+			if not err then
+				rot.log("display", string.format("%s in box @ %d,%d", name, b.x, b.y))
+				return true
+			end
+			rot.D.skip[b.x .. "," .. b.y .. ":" .. id] = os.clock() + 600
+			rot.log("display skipped", string.format("%s @ %d,%d: %s", name, b.x, b.y, err))
+		end
+	end
 	function rot.D.store()
-		local w = fb.world
 		for _, id in ipairs(cfg.drop.items) do
 			if fb.inv:count(id) > 0 then
-				local name = itemDB[id] and itemDB[id].name or "?"
-				for _, b in ipairs(rot.D.boxes(w, id)) do
-					rot.say(string.format("display box @ %d,%d · %s ×%d", b.x, b.y, name, fb.inv:count(id)))
-					local err = rot.D.toBox(w, b, id)
-					if not state.AutoDrop then return end
-					if not err then
-						rot.log("display", string.format("%s in box @ %d,%d", name, b.x, b.y))
-						return
-					end
-					rot.D.skip[b.x .. "," .. b.y .. ":" .. id] = os.clock() + 600
-					rot.log("display skipped", string.format("%s @ %d,%d: %s", name, b.x, b.y, err))
-				end
+				if rot.D.intoBox(id, "AutoDrop") then return end
 				if state.DropWall then return rot.D.wallSlot(id) end
 				return rot.dropAll(id, cfg.drop.storage, "AutoDrop")
 			end
