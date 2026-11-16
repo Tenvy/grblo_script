@@ -5544,13 +5544,13 @@ do
 		rot.save()
 		rot.say("going to " .. name)
 		task.wait(human.range({ 2, 4 }))
-		if not rot.on() or fb.farmCheckOpen or (state.AutoRotate and cfg.run.force and name ~= cfg.run.world) then return end
+		if not rot.on() or fb.farmCheckOpen or (state.AutoRotate and cfg.run.force and name ~= cfg.run.world and name ~= cfg.storage) then return end
 		rot.hookEnter()
 		local from = rot.inWorld() and fb.world.name or "picker"
 		if from ~= "picker" then
 			fb.worldMenu.openPicker()
 			task.wait(human.range({ 2, 4 }))
-			if state.AutoRotate and cfg.run.force and name ~= cfg.run.world then return end -- you clicked another world: this trip's off
+			if state.AutoRotate and cfg.run.force and name ~= cfg.run.world and name ~= cfg.storage then return end -- you clicked another world: this trip's off
 		end
 		local fg0, t0 = fb.world.fg, os.clock()
 		fb.enterRes, fb.enterFail = nil, nil
@@ -5710,7 +5710,7 @@ do
 	-- A full tile with no drop left on it (you cleared it) is free again.
 	-- S / key: Auto Drop's storage world / toggle (default Auto Rotate's). One pile spot per item
 	-- (P.spots[id]): piles never mix (fb.othersAt).
-	function rot.dropAll(seed, S, key)
+	function rot.dropAll(seed, S, key, soft) -- soft: no floor spot = return "nospot" (caller tries boxes)
 		S, key = S or cfg.storage, key or "AutoRotate"
 		local P = rot.per(S)
 		P.full, P.fulls, P.spot, P.spots = nil, P.fulls or {}, nil, P.spots or {} -- full / spot: older formats
@@ -5731,6 +5731,7 @@ do
 		if not (sp and spotFits(sp.x + sp.dir * ((sp.n or 1) - 1), sp.y, sp.dir)) then
 			local rx, ry = fb.hv.respawnTile(fb.world)
 			sp = rx and findSpot({ x = rx, y = ry }, 2, function(x, y) return P.fulls[x .. "," .. y] end)
+			if not sp and soft then return "nospot" end
 			if not sp then
 				return rot.stop(next(P.fulls) and ("storage full near the door in " .. S .. " · clear some piles")
 					or ("nowhere to drop near the door in " .. S .. " (walls, display boxes full) · use another storage world"))
@@ -6400,7 +6401,7 @@ do
 		return n
 	end
 	-- Display boxes here that may take id, best first: holding id already, then empty, nearest.
-	function rot.D.boxes(w, id)
+	function rot.D.boxes(w, id, allow) -- allow: ids that may share the box (the City Pack's)
 		local s, now, out = fb.player.state(), os.clock(), {}
 		for y, row in pairs(w.fg) do
 			for x, tid in pairs(row) do
@@ -6410,7 +6411,7 @@ do
 				if it and it.display and not it.displayOne and (rot.D.skip[x .. "," .. y .. ":" .. id] or 0) < now then
 					local mine, other = false, false
 					for _, c in pairs(w.displays and w.displays.get(x, y) or {}) do
-						if type(c) == "table" and c[1] == id then mine = true else other = true end
+						if type(c) == "table" and (c[1] == id or (allow and allow[c[1]])) then mine = true else other = true end
 					end
 					if mine or not other then
 						out[#out + 1] = { x = x, y = y, rank = (mine and 0 or 1000) + math.abs(x + 0.5 - s.x) + math.abs(y + 1 - s.y) * 1.5 }
@@ -6599,6 +6600,28 @@ do
 			end
 			rot.D.skip[b.x .. "," .. b.y .. ":" .. id] = os.clock() + 600
 			rot.log("display skipped", string.format("%s @ %d,%d: %s", name, b.x, b.y, err))
+		end
+	end
+	-- Every pack item into ONE box (empty, or holding only pack items); a refusal = the next box.
+	function rot.D.packIntoBox(ids, key)
+		local w, allow = fb.world, {}
+		for _, id in ipairs(ids) do allow[id] = true end
+		for _, b in ipairs(rot.D.boxes(w, ids[1], allow)) do
+			local err
+			for _, id in ipairs(ids) do
+				if fb.inv:count(id) > 0 then
+					rot.say(string.format("display box @ %d,%d · %s", b.x, b.y, itemDB[id] and itemDB[id].name or "?"))
+					err = rot.D.toBox(w, b, id, key)
+					if not state[key] then return true end
+					if err then break end
+				end
+			end
+			if not err then
+				rot.log("display", string.format("City Pack in box @ %d,%d", b.x, b.y))
+				return true
+			end
+			rot.D.skip[b.x .. "," .. b.y .. ":" .. ids[1]] = os.clock() + 600
+			rot.log("display skipped", string.format("City Pack @ %d,%d: %s", b.x, b.y, err))
 		end
 	end
 	function rot.D.store()
@@ -6890,7 +6913,10 @@ do
 		end
 		if #left > 0 then
 			if here ~= S then return rot.go(S) end
-			return rot.dropAll(left)
+			if rot.dropAll(left, nil, nil, true) ~= "nospot" then return end
+			-- no floor near the door (e.g. a room of display boxes): one box for the pack
+			if rot.D.packIntoBox(left, "AutoRotate") then return end
+			return rot.stop("nowhere for the City Pack in " .. S .. " (no floor, display boxes full)")
 		end
 		-- all dropped: gems for more = buy again here, drop them on the next step
 		local pack = state.AutoATM and rot.atmPack()
