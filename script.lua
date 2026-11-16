@@ -734,6 +734,8 @@ local state = {
 	RowFetch = false,
 	RowDrop = false,
 	RotRow = false, -- Auto Rotate's farm phase: Row Farm instead of Auto Farm
+	AutoATM = false, -- Auto Rotate: buy a City Pack (ATM) at its price in gems, store its items
+	IdleQuit = false, -- Auto Rotate: nothing ripe for 15+ min = leave the game, webhook says when to log in
 	PathLeave = false,
 	Humanize = true, -- matches human.on
 	HumanPauses = false, -- humanizer micro / medium pauses (off = the user's middle way, 11-11)
@@ -2341,6 +2343,7 @@ local function collectTile(first)
 	local function release(o)
 		o.collecting = nil
 		if not fb.tileDrops(o) then return end
+		if fb.rlog then fb.rlog("pickup miss", string.format("tile %d,%d in %s · skipped 30s", o.x, o.y, fb.world.name)) end
 		local now = os.clock()
 		for _, d in ipairs(fb.drops) do
 			local dx, dy = math.floor(d.x), math.floor(d.y)
@@ -2413,6 +2416,7 @@ function fb.farmCollect(t)
 		pcall(collectTile, t)
 		for _, o in ipairs(fb.farmTiles) do o.collecting = nil end
 		fb.collectT = nil
+		if fb.farmStatus == "picking up" then fb.farmStatus = nil end -- don't leave it up while waiting on something else
 	end)
 	return true
 end
@@ -2542,6 +2546,7 @@ local farmTrip -- (trip) -> leave, do it, come back; defined after the Path sect
 
 -- Why we need to leave the farm, if we do: { drop = seedId } or { fetch = blockId }.
 local function tripNeeded()
+	if fb.atmDue then return { atm = true } end -- Auto Rotate buys a City Pack: empty the tiles, then stop
 	if state.FarmDrop then
 		for sd in pairs(fb.farmSeeds) do
 			if fb.inv:count(sd) >= 200 then return { drop = sd } end
@@ -2576,6 +2581,11 @@ local function farmStep()
 			if layer and id == t.mine then busy = true end
 		end
 		if not busy then
+			if trip.atm then -- tiles empty: hand over to Auto Rotate (rot.atmCheck buys next)
+				fb.atmDue = "ready"
+				fb.toggleSet.AutoFarm(false)
+				return
+			end
 			farmTrip(trip)
 			return
 		end
@@ -3397,11 +3407,20 @@ end
 
 -- Auto Farm's seed stash: 5+ tiles from the farm (off the way back), kept per world so every
 -- 200 goes on the same pile.
+-- Never next to / past a pile of the farm block (11-15: stash at 37, block pile at 36 = the stand
+-- tile; fetching the blocks walked into the seeds and took 200 back).
+local function badStash(px, py)
+	if fb.fullTiles[fb.world.name .. ":" .. px .. "," .. py] then return true end
+	local want, dir = fb.farmPick or fb.farmLast, px > fb.farmHome.x and 1 or -1
+	for _, d in ipairs(fb.drops) do
+		if want and d.id == want and math.abs(d.y - (py + 0.5)) < 1.5 and (math.floor(d.x) - px) * dir >= -1 then return true end
+	end
+end
 local function dropSpot()
 	SIM.solid = {}
 	local sp = fb.dropSpot
-	if sp and sp.world == fb.world.name and spotFits(sp.x, sp.y, sp.dir) then return sp end
-	fb.dropSpot = findSpot(fb.farmHome, 5, function(x, y) return fb.fullTiles[fb.world.name .. ":" .. x .. "," .. y] end)
+	if sp and sp.world == fb.world.name and spotFits(sp.x, sp.y, sp.dir) and not badStash(sp.x + sp.dir, sp.y) then return sp end
+	fb.dropSpot = findSpot(fb.farmHome, 5, badStash)
 	return fb.dropSpot
 end
 
@@ -3414,6 +3433,21 @@ end
 -- on the full pile tile, drop on the next (sp.n = pile tiles, kept for later trips + inPile).
 -- Returns error or nil, + how many items were dropped.
 -- mix: ids allowed to share a pile tile (default ids), e.g. Auto Harvest's block + seed.
+-- Wait out the game's own drop cooldown ("Slow down!"): onDrop's upvalue table holds DROP_COOLDOWN
+-- (1s on v1860, was ~0.3) and lastDropAt (os.clock). Not found = 1.2s. + a human beat.
+function fb.dropGap()
+	if not fb.dropCD and fb.avatar and fb.avatar.onDrop then
+		for _, u in ipairs(debug.getupvalues(fb.avatar.onDrop)) do
+			if type(u) == "table" and rawget(u, "DROP_COOLDOWN") and rawget(u, "lastDropAt") then fb.dropCD = u break end
+		end
+	end
+	local t = fb.dropCD
+	local cd = t and tonumber(t.DROP_COOLDOWN) or 1.2
+	local last = t and tonumber(t.lastDropAt) or fb.lastDropAt or 0
+	local wait = last + cd - os.clock()
+	task.wait(math.clamp(wait, 0, cd) + human.range({ 0.1, 0.3 }))
+	fb.lastDropAt = os.clock()
+end
 local function dropStack(sp, ids, mode, key, mix)
 	local found0 = os.clock()
 	while not fb.findAvatar() and state[key or "AutoFarm"] and os.clock() - found0 < 8 do task.wait(0.5) end
@@ -3440,10 +3474,12 @@ local function dropStack(sp, ids, mode, key, mix)
 			local n = fb.inv:count(id)
 			if n > 0 then
 				-- refused locally (bag unchanged): "Slow down!", a punch turned you (0.2s), or the tile
-				-- in front won't take drops -> face again and retry twice, then try the next tile out
-				for try = 1, 3 do
+				-- in front won't take drops -> face again and retry, then the next tile out. Only a tile
+				-- that can't take it moves the pile: each try waits the game's real cooldown (fb.dropGap;
+				-- 11-16 the old 0.35/0.6s gaps hit "Slow down!" 3 times and spread a pack over tiles).
+				for try = 1, 4 do
 					if try > 1 then faceIt() end
-					task.wait(try == 1 and 0.35 or 0.6) -- the game's "Slow down!" gap between drops
+					fb.dropGap() -- the game's "Slow down!" gap between drops
 					fb.avatar.onDrop(id, n)
 					if fb.inv:count(id) < n then break end
 				end
@@ -5345,7 +5381,7 @@ do
 	-- one settings file per account: 2 clients on one PC share the workspace folder
 	local rot = { FILE = "growblox_auto_" .. players.LocalPlayer.Name .. ".json", FRESH = 900, page = pages.Rotate, bad = {}, loading = true,
 		COOL = { { 60, 120 }, { 180, 300 }, { 300, 480 } }, -- s of cool-down after the 1st / 2nd / 3rd reject stop in 30 min
-		SETTINGS = { "FastBreak", "BreakWalk", "FarmFetch", "FarmDrop", "RowFetch", "RowDrop", "RotRow", "PathLeave", "Humanize", "HumanPauses", "PlantBurst", "DoorHover", "DoorTags", "UltimateFPS", "BlankScreen", "AntiIdle", "DropWall", "NoDrop", "Guard", "FarmTop" },
+		SETTINGS = { "FastBreak", "BreakWalk", "FarmFetch", "FarmDrop", "RowFetch", "RowDrop", "RotRow", "PathLeave", "Humanize", "HumanPauses", "PlantBurst", "DoorHover", "DoorTags", "UltimateFPS", "BlankScreen", "AntiIdle", "DropWall", "NoDrop", "Guard", "FarmTop", "AutoATM", "IdleQuit" },
 		MODES = { "AutoBreak", "AutoCollect", "AutoFarm", "AutoHarvest", "AutoPlant", "RowFarm" } } -- RowFarm: only switched off (Rotate drives the bot)
 	local cfg = (function()
 		local ok, c = pcall(function() return game:GetService("HttpService"):JSONDecode(readfile(rot.FILE)) end)
@@ -5687,7 +5723,9 @@ do
 			end
 			if not kept then P.fulls[k] = nil end
 		end
-		local sk = tostring(seed) -- string key: JSONEncode won't take a sparse number-keyed table
+		-- seed: one id, or a list of ids sharing one pile (the City Pack's items, key "pack")
+		local ids = type(seed) == "table" and seed or { seed }
+		local sk = type(seed) == "table" and "pack" or tostring(seed) -- string key: JSONEncode won't take a sparse number-keyed table
 		local sp = P.spots[sk]
 		SIM.solid = {}
 		if not (sp and spotFits(sp.x + sp.dir * ((sp.n or 1) - 1), sp.y, sp.dir)) then
@@ -5699,8 +5737,9 @@ do
 			end
 			P.spots[sk] = sp
 		end
-		rot.say(string.format("dropping %s ×%d @ %d,%d", itemDB[seed].name, fb.inv:count(seed), sp.x + sp.dir, sp.y))
-		local err = dropStack(sp, { seed }, "collect", key)
+		local what = #ids > 1 and (#ids .. " items") or string.format("%s ×%d", itemDB[ids[1]].name, fb.inv:count(ids[1]))
+		rot.say(string.format("dropping %s @ %d,%d", what, sp.x + sp.dir, sp.y))
+		local err = dropStack(sp, ids, "collect", key)
 		if err == "drop spot full · set a new one" then
 			for i = 1, sp.n or 1 do P.fulls[(sp.x + sp.dir * i) .. "," .. sp.y] = true end
 			P.spots[sk] = nil
@@ -5715,11 +5754,17 @@ do
 	-- Discord webhook when a world's round ends: how long it took, seeds that didn't fit (bag + dropped
 	-- here at the last plant's end), gems gained (the HUD's gem count, local: never GetGems).
 	-- Sent with the executor's request() (Delta / Opiumware: `request`), in the background.
-	function rot.report(F)
+	-- One embed to the webhook. sync = wait for the send (leaving the game right after).
+	function rot.post(embed, sync)
 		local url = cfg.webhook or ""
 		if not url:match("^https://discord%.com/api/webhooks/") and not url:match("^https://discordapp%.com/api/webhooks/") then return end
 		local req = (syn and syn.request) or (http and http.request) or http_request or request
 		if not req then return end
+		local r = { Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" },
+			Body = game:GetService("HttpService"):JSONEncode({ embeds = { embed } }) }
+		if sync then pcall(req, r) else task.spawn(pcall, req, r) end
+	end
+	function rot.report(F)
 		local P, R = rot.per(F), cfg.run
 		local secs = R.t0 and os.time() - R.t0
 		local g1 = fb.gemsNow()
@@ -5731,10 +5776,28 @@ do
 			{ name = "Gems", value = (g1 and R.g0) and string.format("+%d", math.max(0, g1 - R.g0)) or "?", inline = true },
 			{ name = "Next ripe", value = ready and ready > 0 and rot.fmt(ready) or "-", inline = true },
 		}
-		local body = game:GetService("HttpService"):JSONEncode({ embeds = { {
-			title = "Done · " .. F, description = seed .. " · " .. players.LocalPlayer.Name, color = 0x57F287, fields = fields,
-		} } })
-		task.spawn(pcall, req, { Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
+		rot.post({ title = "Done · " .. F, description = seed .. " · " .. players.LocalPlayer.Name, color = 0x57F287, fields = fields })
+	end
+	-- Nothing ripe for 15+ min (IdleQuit): leave the world like Exit, tell the webhook when the first
+	-- farm world is ripe (Discord <t:…> = shown in the reader's own time zone), leave the game. Logging
+	-- back in any time later resumes the rotation (cfg.run.quit, see the resume check below).
+	function rot.quit(soon)
+		rot.modesOff()
+		local lines = {}
+		for _, name in ipairs(cfg.worlds) do
+			local r = rot.per(name).ready
+			lines[#lines + 1] = r and string.format("%s · <t:%d:t> (<t:%d:R>)", name, math.floor(r), math.floor(r)) or (name .. " · ?")
+		end
+		local at = math.floor(soon)
+		rot.post({ title = "Logged off · " .. players.LocalPlayer.Name, color = 0x5865F2,
+			description = string.format("Log in at **<t:%d:t>** (<t:%d:R>)\n\n%s", at, at, table.concat(lines, "\n")) }, true)
+		rot.log("quit", string.format("nothing ripe · log in at %s", os.date("%H:%M", os.time() + (soon - workspace:GetServerTimeNow()))))
+		cfg.run.quit = true
+		rot.save()
+		rot.left = true
+		pcall(leaveWorld)
+		task.wait(human.range({ 2, 4 }))
+		players.LocalPlayer:Kick(string.format("Auto Rotate: nothing ripe · log in again in %s", rot.fmt(soon - workspace:GetServerTimeNow())))
 	end
 	function rot.finish(F)
 		pcall(rot.report, F)
@@ -6109,7 +6172,7 @@ do
 	end
 
 	function rot.step()
-		if not rot.on() then task.wait(0.5) return end
+		if rot.left or not rot.on() then task.wait(0.5) return end -- left: kicked out by rot.quit, no more saves
 		if os.clock() - (rot.savedAt or 0) > 60 then rot.save() end -- keeps "on" fresh for a resume
 		if os.clock() < (rot.holdUntil or 0) then task.wait(0.25) return end
 		if os.clock() < (rot.restUntil or 0) then
@@ -6126,10 +6189,13 @@ do
 		if not (fb.world and fb.player and fb.inv and fb.drops) then rot.refind() task.wait(1) return end
 		local run = cfg.run
 		local here = rot.inWorld() and fb.world.name or nil
+		if rot.atmCheck(here) then return end
+		if run.phase == "atm" then return rot.atm(here) end
 		if not run.phase or run.phase == "wait" then
 			local name, soon = rot.pick(here)
 			if name then return rot.set("harvest", name) end
 			if run.phase ~= "wait" then rot.set("wait") end
+			if state.IdleQuit and soon and soon - workspace:GetServerTimeNow() > 900 then return rot.quit(soon) end
 			if not here or here == cfg.storage or table.find(cfg.worlds, here) then return rot.go(rot.randomWorld()) end
 			rot.say(string.format("waiting in %s · next ripe in %s", here, rot.fmt((soon or 0) - workspace:GetServerTimeNow())))
 			task.wait(5)
@@ -6287,7 +6353,7 @@ do
 					if P.block then n[P.block] = n[P.block] or 0 end
 					for id in pairs(n) do
 						local it = itemDB[id]
-						if it and it.kind ~= "seed" and seedOf(id) then ids[#ids + 1] = id end
+						if it and it.farmable and not it.kind then ids[#ids + 1] = id end -- = Auto Farm's own list (farmChoices)
 					end
 					table.sort(ids, function(a, b) return itemDB[a].name < itemDB[b].name end)
 					local function pick(id) -- farming here right now: start it over with that block
@@ -6373,7 +6439,7 @@ do
 		if not (state[key] and snapTo(b.x - dir, b.y)) then return "couldn't reach it" end
 		if not rot.D.face(w, dir, b.x, b.y, true) then return "couldn't line up with it" end -- never on the floor instead
 		local n, had = fb.inv:count(id), rot.D.amount(w, b.x, b.y, id)
-		task.wait(0.35) -- the game's "Slow down!" gap
+		fb.dropGap() -- the game's "Slow down!" gap
 		fb.avatar.onDrop(id, n)
 		if fb.inv:count(id) >= n then return "refused" end
 		local t0 = os.clock()
@@ -6495,7 +6561,7 @@ do
 		if ux then placeTile("fg", ux, uy, D.DIRT) end -- the next layer's end support, in reach from here
 		if not D.face(w, dir, tx, ty) then return fail("couldn't face the tile") end
 		local n = fb.inv:count(id)
-		task.wait(0.35) -- the game's "Slow down!" gap
+		fb.dropGap() -- the game's "Slow down!" gap
 		fb.avatar.onDrop(id, n)
 		if fb.inv:count(id) >= n then return fail("the game won't drop " .. name .. " there") end
 		local p = fb.drops[#fb.drops]
@@ -6745,10 +6811,114 @@ do
 		rot.say("webhook test sent · " .. F)
 	end)
 
+	-- City Pack (the shop's ATM pack, key city_pack, 8,500 gems): once the HUD shows its price, stop
+	-- what's running (Auto Farm first breaks its own blocks: fb.atmDue -> tripNeeded), buy it with
+	-- the game's own menu API (menuApi.buy -> BuyItem, the shop button's call), carry its items to
+	-- the storage world (display boxes, then floor piles), then back to the same phase + world.
+	rot.ATM_KEY = "city_pack"
+	function rot.atmPack() -- the shop's offer: { price, items = {{id, n}} }
+		if not rot.atmOffer then
+			for _, m in ipairs(getloadedmodules()) do
+				local ok, v = pcall(require, m)
+				if ok and type(v) == "table" and type(rawget(v, "byKey")) == "table" and v.byKey[rot.ATM_KEY] then
+					rot.atmOffer = v.byKey[rot.ATM_KEY]
+					break
+				end
+			end
+		end
+		return rot.atmOffer
+	end
+	-- true = it acted (rot.step returns)
+	function rot.atmCheck(here)
+		local ph = cfg.run.phase
+		local pack = state.AutoATM and here and not state.NoDrop and cfg.storage ~= "" and ph ~= "atm" and ph ~= "store"
+			and os.clock() >= (rot.atmRetryAt or 0) and rot.atmPack()
+		if not (pack and (fb.gemsNow() or 0) >= (pack.price or 8500)) then fb.atmDue = nil return end
+		if ph == "farm" and state.AutoFarm then fb.atmDue = fb.atmDue or true return end -- its tiles empty first
+		fb.atmDue = nil
+		rot.modesOff()
+		local n, why = rot.atmBuy(pack)
+		if n == 0 then
+			rot.atmRetryAt = os.clock() + 600
+			rot.log("atm", why)
+			rot.say("City Pack: " .. why .. " · again in 10m", true)
+			return true
+		end
+		local ids = {}
+		for _, it in ipairs(pack.items) do ids[#ids + 1] = it[1] end
+		cfg.run.atm = { ids = ids, back = { phase = ph, world = cfg.run.world } }
+		rot.log("atm", string.format("bought %d City Pack in %s (%s %s) · storing", n, here, tostring(ph), tostring(cfg.run.world)))
+		rot.say(string.format("bought %d City Pack · taking them to %s", n, cfg.storage), true)
+		rot.set("atm")
+		return true
+	end
+	-- Does one more pack fit? A new slot per item the bag doesn't hold, room on the stack for the rest.
+	function rot.atmFits(pack)
+		local need = 0
+		for _, it in ipairs(pack.items) do
+			if fb.inv:count(it[1]) == 0 then need += 1
+			elseif fb.inv:room(it[1]) < it[2] then return false end
+		end
+		return (fb.inv.capacity or 0) - #fb.inv.slots >= need
+	end
+	-- Buy packs while the gems and the bag allow (11-16: "buy them all at once; bag full = drop, then
+	-- buy again"). -> how many, why it stopped (for 0).
+	function rot.atmBuy(pack)
+		local m, price = fb.findMenuApi(), pack.price or 8500
+		if not (m and m.buy) then return 0, "the game's buy function wasn't found" end
+		local n, gems = 0, fb.gemsNow() or 0
+		while rot.on() and gems >= price do
+			if not rot.atmFits(pack) then
+				return n, string.format("bag full (%d/%d slots, %d free needed)", #fb.inv.slots, fb.inv.capacity or 0, #pack.items)
+			end
+			task.wait(human.range({ 1, 3 }))
+			local ok, bought, why, left = pcall(m.buy, rot.ATM_KEY)
+			if not (ok and bought) then return n, "not bought: " .. tostring(ok and why or bought) end
+			n += 1
+			gems = tonumber(left) or gems - price -- buy() returns the server's gem count
+			if cfg.run.g0 then cfg.run.g0 -= price end -- the webhook's gems gained: not minus the packs
+		end
+		return n, "not enough gems"
+	end
+	-- Phase "atm": all pack items on one pile tile in the storage world (no display boxes), then back
+	-- to the phase it cut into.
+	function rot.atm(here)
+		local A, S = cfg.run.atm or {}, cfg.storage
+		local left = {}
+		for _, id in ipairs(A.ids or {}) do
+			if fb.inv:count(id) > 0 then left[#left + 1] = id end
+		end
+		if #left > 0 then
+			if here ~= S then return rot.go(S) end
+			return rot.dropAll(left)
+		end
+		-- all dropped: gems for more = buy again here, drop them on the next step
+		local pack = state.AutoATM and rot.atmPack()
+		if pack and here and (fb.gemsNow() or 0) >= (pack.price or 8500) then
+			local n, why = rot.atmBuy(pack)
+			if n > 0 then
+				rot.log("atm", string.format("bought %d more City Pack", n))
+				return rot.say(string.format("bought %d more City Pack · dropping", n))
+			end
+			rot.log("atm", "no more: " .. tostring(why))
+		end
+		local b = A.back or {}
+		cfg.run.atm = nil
+		rot.log("atm", "pack stored · back to " .. tostring(b.phase) .. " " .. tostring(b.world))
+		rot.set(b.phase or "wait", b.world)
+	end
+	makeSection(rot.page, "City Pack (ATM)", 28)
+	makeToggle(rot.page, "Auto buy City Pack", "8,500 gems: buy it, drop its items in the storage world, back to farming", 29, "AutoATM")
+	makeSection(rot.page, "When nothing is ripe", 30)
+	makeToggle(rot.page, "Leave the game", "Nothing ripe for 15+ min: leave, webhook says when to log in (rotation resumes then)", 31, "IdleQuit")
+
 	-- Settings from the last run (= clicking each switch), then Auto Rotate again if it was on in
 	-- the last 15 min (a teleport to another world's server, a re-run). Right after a teleport the
 	-- game's tables can take a moment to show up: up to 10 tries, 3s apart.
-	local resume = cfg.run.on and os.time() - (cfg.run.at or 0) < rot.FRESH
+	-- quit (IdleQuit left on purpose): resume any time later, once a farm world is ripe (logging in
+	-- early to play = no instant leave again)
+	local resume = cfg.run.on and (cfg.run.quit and rot.pick(nil) ~= nil or not cfg.run.quit and os.time() - (cfg.run.at or 0) < rot.FRESH)
+	cfg.run.quit = nil
 	rot.rkey = resume and "AutoRotate" or "AutoDrop" -- the one that was on (Auto Drop: same 15 min rule)
 	resume = resume or (cfg.drop.on and os.time() - (cfg.drop.at or 0) < rot.FRESH)
 	-- Kicked (267, or Roblox's own 268): this run is over, and it must not come back by itself if
