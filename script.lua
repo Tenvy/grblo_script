@@ -5780,8 +5780,9 @@ do
 		rot.post({ title = "Done · " .. F, description = seed .. " · " .. players.LocalPlayer.Name, color = 0x57F287, fields = fields })
 	end
 	-- Nothing ripe for 15+ min (IdleQuit): leave the world like Exit, tell the webhook when the first
-	-- farm world is ripe (Discord <t:…> = shown in the reader's own time zone), leave the game. Logging
-	-- back in any time later resumes the rotation (cfg.run.quit, see the resume check below).
+	-- farm world is ripe (Discord <t:…> = shown in the reader's own time zone), leave the game, then
+	-- join again from the "Disconnected" screen 0.5-2 min after that (rot.rejoin). Logging back in any
+	-- time later also resumes the rotation (cfg.run.quit, see the resume check below).
 	function rot.quit(soon)
 		rot.modesOff()
 		local lines = {}
@@ -5789,16 +5790,36 @@ do
 			local r = rot.per(name).ready
 			lines[#lines + 1] = r and string.format("%s · <t:%d:t> (<t:%d:R>)", name, math.floor(r), math.floor(r)) or (name .. " · ?")
 		end
-		local at = math.floor(soon)
+		local secs = soon - workspace:GetServerTimeNow() + human.range({ 30, 120 })
+		local at = math.floor(workspace:GetServerTimeNow() + secs)
 		rot.post({ title = "Logged off · " .. players.LocalPlayer.Name, color = 0x5865F2,
-			description = string.format("Log in at **<t:%d:t>** (<t:%d:R>)\n\n%s", at, at, table.concat(lines, "\n")) }, true)
-		rot.log("quit", string.format("nothing ripe · log in at %s", os.date("%H:%M", os.time() + (soon - workspace:GetServerTimeNow()))))
+			description = string.format("Back by itself at **<t:%d:t>** (<t:%d:R>) · not back by then (Roblox closed)? log in\n\n%s",
+				at, at, table.concat(lines, "\n")) }, true)
+		rot.log("quit", string.format("nothing ripe · back at %s", os.date("%H:%M", os.time() + secs)))
 		cfg.run.quit = true
 		rot.save()
-		rot.left = true
+		rot.left = true -- also tells the kick handler (resume block) this kick is ours
 		pcall(leaveWorld)
 		task.wait(human.range({ 2, 4 }))
-		players.LocalPlayer:Kick(string.format("Auto Rotate: nothing ripe · log in again in %s", rot.fmt(soon - workspace:GetServerTimeNow())))
+		local back = os.clock() + secs - 3 -- os.clock: no device clock drift
+		players.LocalPlayer:Kick(string.format("Auto Rotate: nothing ripe · back by itself in %s", rot.fmt(secs)))
+		task.spawn(rot.rejoin, back)
+	end
+	-- After rot.quit's kick: the script still runs behind Roblox's "Disconnected" screen. At `back`
+	-- (os.clock), teleport into the game again (autoexec re-runs the script there, resume picks up);
+	-- still here 1-2 min later = it failed, try again.
+	function rot.rejoin(back)
+		local tp = game:GetService("TeleportService")
+		while fb.gen == myGen do
+			if os.clock() >= back then
+				rot.log("rejoin", "teleporting back in")
+				local ok, err = pcall(tp.Teleport, tp, game.PlaceId, players.LocalPlayer)
+				if not ok then rot.log("rejoin", "failed: " .. tostring(err)) end
+				task.wait(human.range({ 60, 120 }))
+			else
+				task.wait(math.min(back - os.clock(), 30))
+			end
+		end
 	end
 	function rot.finish(F)
 		pcall(rot.report, F)
@@ -6936,7 +6957,7 @@ do
 	makeSection(rot.page, "City Pack (ATM)", 28)
 	makeToggle(rot.page, "Auto buy City Pack", "8,500 gems: buy it, drop its items in the storage world, back to farming", 29, "AutoATM")
 	makeSection(rot.page, "When nothing is ripe", 30)
-	makeToggle(rot.page, "Leave the game", "Nothing ripe for 15+ min: leave, webhook says when to log in (rotation resumes then)", 31, "IdleQuit")
+	makeToggle(rot.page, "Leave the game", "Nothing ripe for 15+ min: leave the game, join again by itself when a world is ripe (webhook says when)", 31, "IdleQuit")
 
 	-- Settings from the last run (= clicking each switch), then Auto Rotate again if it was on in
 	-- the last 15 min (a teleport to another world's server, a re-run). Right after a teleport the
@@ -6944,14 +6965,18 @@ do
 	-- quit (IdleQuit left on purpose): resume any time later, once a farm world is ripe (logging in
 	-- early to play = no instant leave again)
 	local resume = cfg.run.on and (cfg.run.quit and rot.pick(nil) ~= nil or not cfg.run.quit and os.time() - (cfg.run.at or 0) < rot.FRESH)
+	if resume and cfg.run.quit then
+		rot.log("back", "rejoined after leaving")
+		rot.post({ title = "Back online · " .. players.LocalPlayer.Name, color = 0x57F287, description = "rotation resumes" })
+	end
 	cfg.run.quit = nil
 	rot.rkey = resume and "AutoRotate" or "AutoDrop" -- the one that was on (Auto Drop: same 15 min rule)
 	resume = resume or (cfg.drop.on and os.time() - (cfg.drop.at or 0) < rot.FRESH)
 	-- Kicked (267, or Roblox's own 268): this run is over, and it must not come back by itself if
-	-- you rejoin inside the FRESH window.
+	-- you rejoin inside the FRESH window. Not rot.quit's own kick (rot.left): that one must resume.
 	pcall(function()
 		guiService.ErrorMessageChanged:Connect(function()
-			if fb.gen ~= myGen or not (rot.on() or cfg.run.on or cfg.drop.on) then return end
+			if fb.gen ~= myGen or rot.left or not (rot.on() or cfg.run.on or cfg.drop.on) then return end
 			if setthreadidentity then pcall(setthreadidentity, 8) end -- GetErrorCode is Roblox-only
 			local code = guiService:GetErrorCode()
 			if code ~= Enum.ConnectionError.DisconnectLuaKick and code ~= Enum.ConnectionError.DisconnectOnRemoteSysStats then return end
