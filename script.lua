@@ -5294,6 +5294,7 @@ do
 	local rj = {
 		MODES = { "AutoBreak", "AutoCollect", "AutoFarm", "AutoHarvest", "AutoPlant" },
 		STATUS = { AutoBreak = "brStatus", AutoFarm = "farmStatus", AutoHarvest = "hvStatus", AutoPlant = "plStatus" },
+		FILE = "growblox_rejoin_" .. players.LocalPlayer.Name .. ".json", -- modes to switch back on after a teleport
 	}
 	fb.rejoins = fb.rejoins or {}
 	function rj.say(on, msg)
@@ -5330,12 +5331,36 @@ do
 		rj.say(on, "world closed" .. tag .. " · rejoining " .. name)
 		task.wait(human.range({ 3, 6 })) -- the picker opens after the zoom and leaves: entering before that gets undone
 		if fb.gen ~= myGen or fb.farmCheckOpen then return end
-		local fg0 = fb.world.fg
-		fb.worldMenu.enter(name) -- = typing the name + Enter World; the game's applyWorld swaps in a new fg grid
-		local t0 = os.clock()
-		while fb.world.fg == fg0 and os.clock() - t0 < 15 do task.wait(0.25) end
-		if fb.world.fg == fg0 or fb.world.name ~= name then
-			return rj.say(on, "couldn't get back into " .. name .. " · modes left off")
+		if fb.hookEnter then fb.hookEnter() end -- fb.enterRes / fb.enterFail (Auto Rotate's hook)
+		-- The world may be on another server: the game teleports you ("Entering X...") and this script
+		-- ends; the autoexec run over there switches the modes back on (rj.FILE, see below).
+		pcall(writefile, rj.FILE, game:GetService("HttpService"):JSONEncode({ world = name, modes = on, at = os.time() }))
+		local entered, why
+		for try = 1, 3 do
+			local fg0, t0 = fb.world.fg, os.clock()
+			fb.enterRes, fb.enterFail = nil, nil
+			fb.worldMenu.enter(name) -- = typing the name + Enter World; the game's applyWorld swaps in a new fg grid
+			local r = fb.enterRes
+			if r and r.teleport then
+				-- a teleport that never comes (seen 11-17, stuck on "Entering JNMA..."): give it 2 min,
+				-- then the game's own enterFailed, which also frees the picker for the next try
+				rj.say(on, "rejoining " .. name .. " · teleporting (it's on another server)")
+				while not fb.enterFail and os.clock() - t0 < 120 do task.wait(0.5) end
+				if not fb.enterFail then fb.worldMenu.enterFailed("Couldn't reach that world, try again.") end
+			elseif not r then
+				fb.worldMenu.enterFailed("") -- the picker was still busy (an earlier "Entering...")
+			else
+				while fb.world.fg == fg0 and os.clock() - t0 < 15 do task.wait(0.25) end
+			end
+			entered = fb.world.fg ~= fg0 and fb.world.name == name
+			if entered or fb.gen ~= myGen then break end
+			why = fb.enterFail ~= nil and fb.enterFail ~= "" and fb.enterFail or r and r.msg or "the picker was busy"
+			rj.say(on, string.format("couldn't get back into %s (%s) · try %d of 3", name, tostring(why), try))
+			task.wait(human.range({ 10, 20 }) * try)
+		end
+		pcall(delfile, rj.FILE)
+		if not entered then
+			return rj.say(on, "couldn't get back into " .. name .. " (" .. tostring(why) .. ") · modes left off")
 		end
 		task.wait(human.range({ 2, 4 })) -- land at the door, let drops / trees arrive
 		if fb.gen ~= myGen then return end
@@ -5365,6 +5390,31 @@ do
 		end
 		if #on > 0 and name and name ~= "" then task.spawn(rj.run, name, tostring(why or ""), on) end
 	end, function() return fb.world and fb.world.name or "" end)
+	-- This run started after rj.run's teleport (the world was on another server): once you're in that
+	-- world, switch its modes back on. Auto Farm stays off: its tiles are the ones around where you
+	-- stand when it goes on, and its farm tile was in the old run. Older than 10 min = stale (a crash).
+	task.spawn(function()
+		local ok, p = pcall(function() return game:GetService("HttpService"):JSONDecode(readfile(rj.FILE)) end)
+		if not (ok and type(p) == "table" and type(p.modes) == "table") then return end
+		pcall(delfile, rj.FILE)
+		if os.time() - (tonumber(p.at) or 0) > 600 then return end
+		for _ = 1, 10 do
+			task.wait(3) -- the game's tables can take a moment after a teleport
+			if fb.gen ~= myGen then return end
+			fb.world, fb.drops = findWorld() or fb.world, findDrops() or fb.drops
+			fb.player, fb.inv = findPlayer() or fb.player, findInventory() or fb.inv
+			if fb.world and fb.world.name == p.world then
+				local back, left = {}, {}
+				for _, k in ipairs(p.modes) do
+					if k ~= "AutoFarm" and fb.toggleSet[k] and not state[k] then pcall(fb.toggleSet[k], true) end
+					if state[k] then back[#back + 1] = k else left[#left + 1] = k end
+				end
+				if #back > 0 then rj.say(back, "rejoined " .. p.world .. " (other server) · back on") end
+				if #left > 0 then rj.say(left, "rejoined " .. p.world .. " (other server) · switch it on again yourself") end
+				return
+			end
+		end
+	end)
 end
 
 -- ===== Auto Rotate (Rotate page): every farm world in turn, forever =====
@@ -5540,6 +5590,7 @@ do
 			end
 		end
 	end
+	fb.hookEnter = rot.hookEnter -- the world-closed rejoin (above rot) uses it too
 	-- Leave like the menu's Exit (WorldMenu.openPicker), enter like typing the name + Enter World.
 	-- Same server: the world loads in place right away (applyWorld swaps in a new fg grid). Another
 	-- server: the game says "Entering X..." and teleports you; that ends this script and the
