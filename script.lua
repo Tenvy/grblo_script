@@ -4076,6 +4076,12 @@ do
 			for _, h in pairs(net.treeChanged.getListeners()) do
 				for _, f in ipairs(debug.getupvalues(h)) do
 					if type(f) == "function" and debug.info(f, "n") == "setTree" then return debug.getupvalues(f)[2] end
+					-- v1945: the listener calls G.setTree on the game's main table (net + G are its only
+					-- upvalues); G.trees = { [y * w + x] = {p = planted at, f = fruit} }. setTree's own
+					-- upvalue 2 is now the sprite table (no p), so not that one.
+					if type(f) == "table" and type(rawget(f, "setTree")) == "function" and type(rawget(f, "trees")) == "table" then
+						return f.trees
+					end
 				end
 			end
 		end)
@@ -5692,17 +5698,32 @@ do
 		local tx, ty = math.floor(d.x), math.floor(d.y)
 		runBot(standable(tx, ty) and { x = tx + 0.5, y = ty + 0.5, tile = true, exact = true } or d, "collect", rot.key())
 		local t0 = os.clock()
-		while rot.on() and table.find(fb.drops, d) and (d.taking or os.clock() - t0 < 0.5) and os.clock() - t0 < 3 do
+		-- a box (your own, Auto Drop): standing on its tile makes the game ask the server for all of it
+		-- (displayTake), no `taking` flag, so wait for the bag instead
+		while rot.on() and table.find(fb.drops, d) and fb.inv:count(d.id) == n0
+			and (d.taking or d.display or os.clock() - t0 < 0.5) and os.clock() - t0 < 3 do
 			task.wait(0.05)
 		end
 		fb.fetching = nil
 		if fb.inv:count(d.id) == n0 and table.find(fb.drops, d) then fb.dropSkip[d.uid] = os.clock() + 30 end
 	end
-	function rot.anyPile(id) -- any drop of id here, skipped or not
+	-- d is the content of a display box you own (only the owner can take it out)
+	function rot.ownBox(d)
+		local w = fb.world
+		return d.display ~= nil and w ~= nil and w.vendOwner ~= nil and select(2, pcall(w.vendOwner, d.display.x, d.display.y)) == true
+	end
+	-- any drop of id here, skipped or not; boxes: + your own display boxes holding it (Auto Drop)
+	function rot.anyPile(id, boxes)
 		for _, d in ipairs(fb.drops) do
-			if d.id == id and d.uid and not d.pending then return true end
+			if d.id == id and d.uid and not d.pending and (not d.display or boxes and rot.ownBox(d)) then return true end
 		end
 		return false
+	end
+	function rot.boxPile(id) -- your own display box holding id, not skipped (rot.fetch walks onto it)
+		local now = os.clock()
+		for _, d in ipairs(fb.drops) do
+			if d.id == id and d.uid and not d.pending and rot.ownBox(d) and not (fb.dropSkip[d.uid] and fb.dropSkip[d.uid] > now) then return d end
+		end
 	end
 	-- Drop every `seed` you carry in the storage world, 2+ tiles from its door (dropStack: the pile
 	-- grows outward when a tile is full; a full spot = its pile tiles go in P.fulls and the next
@@ -5807,7 +5828,7 @@ do
 	end
 	-- After rot.quit's kick: the script still runs behind Roblox's "Disconnected" screen. At `back`
 	-- (os.clock), teleport into the game again (autoexec re-runs the script there, resume picks up);
-	-- still here 1-2 min later = it failed, try again.
+	-- still here 4-6 min later = it failed, try again (a good one took ~3 min on 11-16).
 	function rot.rejoin(back)
 		local tp = game:GetService("TeleportService")
 		while fb.gen == myGen do
@@ -5815,7 +5836,7 @@ do
 				rot.log("rejoin", "teleporting back in")
 				local ok, err = pcall(tp.Teleport, tp, game.PlaceId, players.LocalPlayer)
 				if not ok then rot.log("rejoin", "failed: " .. tostring(err)) end
-				task.wait(human.range({ 60, 120 }))
+				task.wait(human.range({ 240, 360 }))
 			else
 				task.wait(math.min(back - os.clock(), 30))
 			end
@@ -6668,9 +6689,9 @@ do
 		if here == C.supply then
 			local left, room = false, false
 			for _, id in ipairs(C.items) do
-				local pile = fb.inv:room(id) > 0 and nearestPile(id)
+				local pile = fb.inv:room(id) > 0 and (nearestPile(id) or rot.boxPile(id))
 				if pile then return rot.fetch(pile) end
-				left = left or rot.anyPile(id)
+				left = left or rot.anyPile(id, true)
 				room = room or fb.inv:room(id) > 0
 			end
 			C.more = left
@@ -6726,7 +6747,7 @@ do
 		local C, bag, here, ids, seen = cfg.drop, {}, {}, {}, {}
 		for _, sl in ipairs(fb.inv and fb.inv.slots or {}) do bag[sl.id] = (bag[sl.id] or 0) + sl.n end
 		for _, d in ipairs(fb.drops or {}) do
-			if d.uid and not (d.pending or d.display) then here[d.id] = (here[d.id] or 0) + d.n end
+			if d.uid and not d.pending and (not d.display or rot.ownBox(d)) then here[d.id] = (here[d.id] or 0) + d.n end
 		end
 		local q = rot.D.search.Text:lower()
 		for _, src in ipairs({ C.items, bag, here }) do
