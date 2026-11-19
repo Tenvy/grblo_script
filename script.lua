@@ -245,7 +245,7 @@ do
 	end
 	-- Hit cooldown shared by every hitter: the drawn gap, and never under HIT_GAP after any hit
 	-- (fb.lastHit is also stamped by the act.send hook for your manual punches).
-	local function hitReadyAt() return math.max(fb.hitAt or 0, fb.lastHit + HIT_GAP) end
+	local function hitReadyAt() return math.max(fb.hitAt or 0, fb.lastHit + (fb.lim and fb.lim("hit", HIT_GAP) or HIT_GAP)) end
 	function human.hitReady() return os.clock() >= hitReadyAt() end
 	function human.hitWait()
 		local wait = hitReadyAt() - os.clock()
@@ -253,7 +253,7 @@ do
 	end
 	function human.hitDone(base) -- base: a slower floor than HIT_GAP for this hit (harvest)
 		fb.lastHit = os.clock()
-		fb.hitAt = fb.lastHit + human.gap(base or HIT_GAP)
+		fb.hitAt = fb.lastHit + human.gap(base or (fb.lim and fb.lim("hit", HIT_GAP) or HIT_GAP))
 	end
 end
 fb.human = human -- for in-client checks (get-data-by-code)
@@ -570,7 +570,7 @@ end
 -- both accepted, so places don't share the hit cooldown. We use the client UI's own 0.15.
 local PLACE_GAP = 0.3 -- v1225 refuses places 0.15s apart ("placing too fast"); one farm reject 11-10 with places 0.18s apart
 local function placeTile(layer, x, y, id, gap) -- gap: an already drawn human.gap(PLACE_GAP) (Row Farm)
-	local wait = (gap or human.gap(fb.placeGapTest or PLACE_GAP)) - (os.clock() - (fb.lastPlace or 0)) -- placeGapTest: live place-gap test only
+	local wait = (gap or human.gap(fb.placeGapTest or (fb.lim and fb.lim("place", PLACE_GAP) or PLACE_GAP))) - (os.clock() - (fb.lastPlace or 0)) -- placeGapTest: live place-gap test only
 	if wait > 0 then task.wait(wait) end
 	sendTile(layer, x, y, id)
 	net.act.send({ kind = 2, x = x + 0.5, y = y + 0.5 }) -- v1159 client: the build act sits on the tile center
@@ -733,6 +733,20 @@ local state = {
 	RowFarm = false,
 	RowFetch = false,
 	RowDrop = false,
+	FarmTop = false, -- Auto Farm layouts above your head: 3 / 6 / 10 on top (one at a time, fb.topLayout)
+	FarmTop6 = false,
+	FarmTop10 = false,
+	FarmBox = false, -- 3 on top + left / right / your own tile
+	FarmLine = false, -- left / your own tile / right
+	FarmLine5 = false, -- 2 left / your own tile / 2 right
+	FarmSelf = false, -- your own tile only
+	FarmPair = false, -- your own tile + right
+	FarmSafe = true, -- Auto Farm speed (fb.SPEEDS): Safe = HIT_GAP / PLACE_GAP / SETTLE; L1 .. L2 faster, one at a time
+	FarmL1 = false,
+	FarmL125 = false,
+	FarmL15 = false,
+	FarmL175 = false,
+	FarmL2 = false,
 	RotRow = false, -- Auto Rotate's farm phase: Row Farm instead of Auto Farm
 	AutoATM = false, -- Auto Rotate: buy a City Pack (ATM) at its price in gems, store its items
 	IdleQuit = false, -- Auto Rotate: nothing ripe for 15+ min = leave the game, webhook says when to log in
@@ -1576,6 +1590,54 @@ local function farmBlock()
 	return best and best.id
 end
 
+-- "N on top" layouts: farm tile offsets { dx, dy } from the tile you stand on (dy -1 = the row above
+-- your head), + stacked = a 2nd row above that one. 3: top-left, top, top-right. 6: those 3 + the 3
+-- above them. 10: 5 wide (2 each side), 2 rows. Box (FarmBox): the 3 on top + left, right and your
+-- own tile (that one only with a background / non-solid block: the server refuses a solid one in
+-- your body). Line (FarmLine): left, your own tile, right. Line 5: 2 each side + yours (the outer
+-- one is linked to the inner one like a stacked column: below = inner, picked up walking through
+-- it). Self: your own tile only. Pair: yours + the one on your right. nil = the default left / right / top.
+fb.TOP_KEYS = { "FarmTop", "FarmTop6", "FarmTop10", "FarmBox", "FarmLine", "FarmLine5", "FarmSelf", "FarmPair" }
+-- Auto Farm speeds, Safe -> L2 (hit / place / place->hit gaps). Measured 11-19, Line (3 tiles),
+-- Pepper Tree, 100 blocks each: Safe 0.618 s/block 1% break rejects, L1 0.579 2%, L1.25 0.610 ~8%,
+-- L1.5 0.567 ~5%, L1.75 0.566 ~6%, L2 untested at 100 (1 reject in 27 at 20-block runs). A rejected
+-- break skips that tile 10s, so past L1 the rejects eat the gain. Only while Auto Farm runs; the
+-- humanizer still adds on top.
+fb.SPEEDS = {
+	{ key = "FarmSafe", name = "Safe", hit = 0.19, place = 0.30, settle = 0.35, note = "real client timing · ~1% rejects" },
+	{ key = "FarmL1", name = "L1", hit = 0.1825, place = 0.275, settle = 0.3375, note = "~6% faster · ~2% rejects (best)" },
+	{ key = "FarmL125", name = "L1.25", hit = 0.1806, place = 0.2688, settle = 0.3344, note = "~8% rejects" },
+	{ key = "FarmL15", name = "L1.5", hit = 0.1787, place = 0.2625, settle = 0.3313, note = "~5% rejects" },
+	{ key = "FarmL175", name = "L1.75", hit = 0.1769, place = 0.2563, settle = 0.3281, note = "~6% rejects" },
+	{ key = "FarmL2", name = "L2", hit = 0.175, place = 0.25, settle = 0.325, note = "most rejects · higher kick risk" },
+}
+function fb.lim(k, base)
+	if not state.AutoFarm then return base end
+	for _, sp in ipairs(fb.SPEEDS) do
+		if state[sp.key] then return sp[k] end
+	end
+	return base
+end
+function fb.rowOnly() return state.FarmLine or state.FarmLine5 or state.FarmSelf or state.FarmPair end -- nothing above your head -- not a local: the main chunk is near Luau's locals limit
+function fb.topLayout()
+	if state.FarmBox then return { { -1, -1 }, { 0, -1 }, { 1, -1 }, { -1, 0 }, { 1, 0 }, { 0, 0 } }, false, 1 end
+	if state.FarmLine then return { { -1, 0 }, { 0, 0 }, { 1, 0 } }, false, 1 end
+	if state.FarmLine5 then return { { -1, 0 }, { 1, 0 }, { 0, 0 }, { -2, 0 }, { 2, 0 } }, false, 2 end -- inner before outer
+	if state.FarmSelf then return { { 0, 0 } }, false, 0 end
+	if state.FarmPair then return { { 1, 0 }, { 0, 0 } }, false, 1 end
+	local half = state.FarmTop10 and 2 or (state.FarmTop or state.FarmTop6) and 1
+	if not half then return nil end
+	local stacked = state.FarmTop6 or state.FarmTop10 or false
+	local out = {}
+	for dy = 1, stacked and 2 or 1 do
+		for dx = -half, half do out[#out + 1] = { dx, -dy } end
+	end
+	return out, stacked, half
+end
+function fb.topName()
+	return state.FarmBox and "Box" or state.FarmLine and "Line" or state.FarmLine5 and "Line 5" or state.FarmSelf and "Self" or state.FarmPair and "Pair" or state.FarmTop10 and "10 on top" or state.FarmTop6 and "6 on top" or "3 on top"
+end
+
 makeSection(farmPage, "Auto Farm", 1)
 local renderFarmToggle = makeToggle(farmPage, "Auto Farm", "Place & break beside you, step / hop onto the drops", 2, "AutoFarm", function(on)
 	if not on then fb.farmStatus = nil return end
@@ -1592,45 +1654,87 @@ local renderFarmToggle = makeToggle(farmPage, "Auto Farm", "Place & break beside
 	-- Lock in the tiles left, right and above your head (all ~1 tile away, so drops are in pickup
 	-- range) that are empty or already hold the block you farm: that one is broken first (counts as
 	-- broken), then refilled like the rest. Skip one your hitbox (0.3 wide each way, 0.95 tall) pokes into.
-	-- "3 on top" (FarmTop): the 3 tiles above your head instead (top-left, top, top-right).
+	-- "3 / 6 / 10 on top" (fb.topLayout): the tiles above your head instead.
+	-- 6 / 10 (stacked): every column is picked up from under it (walk there on the floor row, jump:
+	-- held while its drops are still above you), so a side column needs open floor in your row (and
+	-- the columns between it and you too); a 2nd-row tile only with its 1st-row tile under it.
 	local s = fb.player.state()
 	local row, cx = math.floor(s.y - 0.5), math.floor(s.x)
 	local head = s.y - 0.95 >= row
-	local spots = state.FarmTop and {
-		head and { cx - 1, row - 1 },
-		head and { cx, row - 1 },
-		head and { cx + 1, row - 1 },
-	} or {
-		s.x - 0.3 >= cx and { cx - 1, row },
-		s.x + 0.3 <= cx + 1 and { cx + 1, row },
-		head and { cx, row - 1 },
-	}
+	local layout, stacked = fb.topLayout()
+	local spots = {}
 	local want = fb.farmPick or farmBlock()
-	local tiles = {}
-	for i = 1, 3 do
+	if layout then
+		local it = want and itemDB[want]
+		for i, o in ipairs(layout) do
+			local ok = head -- above you: your head clear of that row
+			if o[2] == 0 then -- Box / Line, your row: left / right = your body not poking in; yours = a block you can stand in
+				ok = o[1] < 0 and s.x - 0.3 >= cx or o[1] > 0 and s.x + 0.3 <= cx + 1
+					or o[1] == 0 and it ~= nil and (it.background or not it.solid) or false
+			end
+			spots[i] = ok and { cx + o[1], row + o[2] } or false
+		end
+	else
+		spots = {
+			s.x - 0.3 >= cx and { cx - 1, row },
+			s.x + 0.3 <= cx + 1 and { cx + 1, row },
+			head and { cx, row - 1 },
+		}
+	end
+	local walk = { [0] = true } -- stacked: column dx can be walked under (floor row open, floor below)
+	if stacked then
+		for _, sg in ipairs({ -1, 1 }) do
+			for dx = sg, sg * 2, sg do
+				walk[dx] = walk[dx - sg] and not fb.player.solidAt(cx + dx, row) and fb.player.solidAt(cx + dx, row + 1) or false
+			end
+		end
+	end
+	local tiles, at = {}, {}
+	for i = 1, layout and #layout or 3 do
 		local p = spots[i]
 		local f = p and fb.world.fg[p[2]] and fb.world.fg[p[2]][p[1]]
 		local b = p and fb.world.bg[p[2]] and fb.world.bg[p[2]][p[1]]
-		if f == 0 or (want and f == want) then
-			-- under: a top-left / top-right tile over open space beside you: drops that fall land there.
-			-- head: its pickup jumps from beside the middle column (a wall beside you to hop onto, or
-			-- no floor there to stand on), so it needs the tile above your head empty at that moment.
-			local diag = p[2] < row and p[1] ~= cx
-			local open = diag and not fb.player.solidAt(p[1], row)
-			tiles[#tiles + 1] = { x = p[1], y = p[2], mine = want and (f == want or b == want) and want or nil,
-				under = open or nil, head = diag and not (open and fb.player.solidAt(p[1], row + 1)) or nil }
+		local ok = f == 0 or (want and f == want)
+		if ok and stacked then ok = walk[p[1] - cx] and (p[2] == row - 1 or at[p[1] .. "," .. (p[2] + 1)] ~= nil) end
+		local inner = state.FarmLine5 and math.abs(p[1] - cx) == 2 and (p[1] + (p[1] < cx and 1 or -1)) .. "," .. row
+		if ok and inner then -- Line 5 outer: walked to through the inner one, floor under both
+			ok = at[inner] ~= nil and fb.player.solidAt(p[1], row + 1) and fb.player.solidAt(at[inner].x, row + 1)
+		end
+		if ok then
+			local t
+			if stacked then
+				t = { x = p[1], y = p[2], mine = want and (f == want or b == want) and want or nil, stack = true }
+				local below = at[p[1] .. "," .. (p[2] + 1)]
+				if below then t.below, below.above = below, t end
+			else
+				-- under: a top-left / top-right tile over open space beside you: drops that fall land there.
+				-- head: its pickup jumps from beside the middle column (a wall beside you to hop onto, or
+				-- no floor there to stand on), so it needs the tile above your head empty at that moment.
+				local diag = p[2] < row and p[1] ~= cx
+				local open = diag and not fb.player.solidAt(p[1], row)
+				t = { x = p[1], y = p[2], mine = want and (f == want or b == want) and want or nil,
+					under = open or nil, head = diag and not (open and fb.player.solidAt(p[1], row + 1)) or nil }
+				-- Box: the tile beside you under a top corner is a farm tile too (filled = a wall to hop
+				-- onto, broken = open): always the head pickup (it checks the wall at that moment) and
+				-- drops may land beside you. self = your own tile (its drops are at your feet).
+				if state.FarmBox and diag then t.under, t.head = true, true end
+				t.self = p[1] == cx and p[2] == row or nil -- Box / Line / Self
+				if inner then t.below, at[inner].above = at[inner], t end
+			end
+			tiles[#tiles + 1] = t
+			at[p[1] .. "," .. p[2]] = t
 		end
 	end
 	fb.farmMid = nil
 	for _, t in ipairs(tiles) do
-		if state.FarmTop and t.x == cx then fb.farmMid = t end
+		if layout and t.x == cx and t.y == row - 1 then fb.farmMid = t end
 	end
-	if state.FarmTop and not fb.farmMid then -- the side ones are picked up jumping past it
-		fb.farmStatus = "3 on top: the tile above your head must be empty (or your farm block)"
+	if layout and not fb.rowOnly() and not fb.farmMid then -- the side ones are picked up jumping past it
+		fb.farmStatus = fb.topName() .. ": the tile above your head must be empty (or your farm block)"
 		return false
 	end
 	if #tiles == 0 then
-		fb.farmStatus = "need empty space (or your farm block) " .. (state.FarmTop and "in the 3 tiles above you" or "beside/above you") .. " · stand centered"
+		fb.farmStatus = "need empty space (or your farm block) " .. (layout and ("in the " .. fb.topName() .. " tiles" .. (state.FarmSelf and " (Self: background / non-solid block only)" or "")) or "beside/above you") .. " · stand centered"
 		return false
 	end
 	-- anchor = the tile's center, so your body (0.3 each side) never touches a farm tile; farmStep
@@ -1638,7 +1742,11 @@ local renderFarmToggle = makeToggle(farmPage, "Auto Farm", "Place & break beside
 	fb.farmTiles, fb.farmAnchor, fb.farmHome = tiles, { x = cx + 0.5, y = s.y }, { x = cx, y = row }
 	fb.farmStart, fb.farmBroken, fb.farmGems, fb.farmStatus = os.clock(), 0, 0, nil
 	fb.farmGems0 = fb.gemsNow() -- gems/h = your gem count's rise (local HUD value, no server call)
-	fb.farmDrain, fb.tripRetryAt, fb.farmRejectRun = false, 0, 0
+	fb.farmDrain, fb.farmDropDue, fb.tripRetryAt, fb.farmRejectRun = false, nil, 0, 0
+	fb.farmActAt = os.clock() -- last place / break (Auto Rotate's stall guard, rot.farm)
+	if (state.FarmBox or state.FarmLine or state.FarmLine5 or state.FarmPair) and not at[cx .. "," .. row] then
+		fb.farmStatus = fb.topName() .. ": your own tile skipped (a solid block can't go in your body) · farming the other " .. #tiles
+	end
 end)
 -- Trips use the path bot, walking + jumping (never teleport).
 local needBot = function(on) if on and not fb.hookMobile() then return false end end
@@ -1659,9 +1767,45 @@ fgl.CellSize = UDim2.new(0.5, -4, 0, 34)
 fgl.CellPadding = UDim2.fromOffset(8, 8)
 fgl.SortOrder = Enum.SortOrder.LayoutOrder
 
-makeToggle(farmPage, "3 on top", "Farm top-left, top & top-right of you (not left / right / top)", 10, "FarmTop", function()
-	if state.AutoFarm then fb.farmStatus = "turn Auto Farm off first to change the layout" return false end
-end)
+-- one layout at a time: switching one on switches the other on-top ones off
+for i, o in ipairs({
+	{ "3 on top", "Farm top-left, top & top-right of you (not left / right / top)" },
+	{ "6 on top", "3 on top + the 3 tiles above them (needs open floor beside you)" },
+	{ "10 on top", "5 wide, 2 rows above you (needs 2 open floor tiles each side)" },
+	{ "Box", "3 on top + left, right & your own tile (own tile: background / non-solid blocks only)" },
+	{ "Line", "Left, your own tile & right (own tile: background / non-solid blocks only)" },
+	{ "Line 5", "2 left, your own tile & 2 right (needs floor under the 4 side tiles)" },
+	{ "Self", "Only your own tile (background / non-solid blocks only)" },
+	{ "Pair", "Your own tile & right (own tile: background / non-solid blocks only)" },
+}) do
+	local key = fb.TOP_KEYS[i]
+	makeToggle(farmPage, o[1], o[2], 9 + i, key, function(on)
+		if state.AutoFarm then fb.farmStatus = "turn Auto Farm off first to change the layout" return false end
+		if on then
+			for _, k in ipairs(fb.TOP_KEYS) do
+				if k ~= key and state[k] and fb.toggleSet[k] then fb.toggleSet[k](false) end
+			end
+		end
+	end)
+end
+
+makeSection(farmPage, "Speed (any layout)", 17)
+for i, sp in ipairs(fb.SPEEDS) do
+	local desc = string.format("Hit %gs · place %gs · place→hit %gs · %s", sp.hit, sp.place, sp.settle, sp.note)
+	makeToggle(farmPage, sp.name, desc, 17 + i, sp.key, function(on)
+		if not on then -- one is always on: switching the last one off = back to Safe (Safe itself stays on)
+			for _, o in ipairs(fb.SPEEDS) do
+				if state[o.key] then return end -- another one took over
+			end
+			if sp.key == "FarmSafe" then return false end
+			if fb.toggleSet.FarmSafe then fb.toggleSet.FarmSafe(true) end
+			return
+		end
+		for _, o in ipairs(fb.SPEEDS) do
+			if o.key ~= sp.key and state[o.key] and fb.toggleSet[o.key] then fb.toggleSet[o.key](false) end
+		end
+	end)
+end
 
 local function renderFarmPicks()
 	for _, c in ipairs(farmGrid:GetChildren()) do
@@ -1728,8 +1872,9 @@ makeToggle(playerPage, "Ultimate FPS", "No 3D pass, no backdrop art, game Low Gr
 -- Blank screen: nothing drawn but black, an fps counter and this panel. No 3D pass, and every game
 -- ScreenGui disabled: Enabled only skips drawing, the game's scripts / physics / packets run on (the
 -- script drives worlds through the game's Lua API, not its buttons). TextureKeep stays (1px images
--- that keep textures loaded for when this goes off). The game's "Warning from System" banner (admin
--- message) or a FarmCheck popup turns it off so you see them.
+-- that keep textures loaded for when this goes off). The game's "Warning from ..." banner (admin
+-- warn/mute/freeze/kick/restart) or a FarmCheck popup turns it off so you see them; "Message from ..."
+-- banners on the same frame (gems, level, announcement...) don't.
 fb.blankOff = fb.blankOff or {} -- ScreenGuis we disabled; in getgenv so a re-run can give them back
 fb.blankScreen = function(on)
 	if fb.blankConn then fb.blankConn:Disconnect() fb.blankConn = nil end
@@ -1767,7 +1912,15 @@ fb.blankScreen = function(on)
 		frames, t0 = 0, os.clock()
 		local menu = playerGui:FindFirstChild("MenuGui")
 		local warn = menu and menu:FindFirstChild("Warning")
-		if fb.farmCheckOpen or (warn and warn:IsA("GuiObject") and warn.Visible) then
+		local adminWarn = false
+		if warn and warn:IsA("GuiObject") and warn.Visible then
+			-- same banner also shows "Message from X: ..." (gems, level, title, summon, announcement,
+			-- unmute): only a real "Warning from ..." (warn/mute/freeze/hell/kick/restart) turns this off
+			for _, d in ipairs(warn:GetDescendants()) do
+				if d:IsA("TextLabel") and d.Text:find("Warning") then adminWarn = true break end
+			end
+		end
+		if fb.farmCheckOpen or adminWarn then
 			pcall(fb.toggleSet.BlankScreen, false)
 			pcall(function()
 				game:GetService("StarterGui"):SetCore("SendNotification", { Title = "Blank screen off", Text = "The game is showing you a message", Duration = 15 })
@@ -1841,8 +1994,7 @@ do
 	local function hook()
 		if fb.wingHook then return true end
 		if os.clock() < (fb.wingRetry or 0) then return end
-		local av = fb.findAvatar and fb.findAvatar()
-		local worn = av and debug.getupvalues(av.buildRange)[1]
+		local worn = fb.findAvatar and fb.wornList and fb.findAvatar() and fb.wornList()
 		if type(worn) ~= "table" then return end
 		fb.wingRetry = os.clock() + 30 -- two getgc scans: don't repeat them every 2s if not found
 		local v9, ww, ai
@@ -2258,7 +2410,9 @@ local function dropsIn(x, y)
 	for _, d in ipairs(fb.drops) do
 		if not d.pending and math.floor(d.x) == x and math.floor(d.y) == y
 			and not (fb.dropSkip[d.uid] and fb.dropSkip[d.uid] > now)
-			and (d.taking or d.id == 112 or (d.armed and fb.inv:room(d.id) > 0)) then
+			-- room: a full stack (200 seeds) can't take it, not even mid-take (11-18: a seed beside you with
+			-- 200 in the bag kept the pickup going, the drop trip never left)
+			and (d.id == 112 or ((d.taking or d.armed) and fb.inv:room(d.id) > 0)) then
 			return true
 		end
 	end
@@ -2295,7 +2449,15 @@ end
 
 -- Drops on farm tile t we can still take, + (top-left / top-right over open space) any that fell
 -- onto the tile under it.
+-- 6 / 10 on top (t.stack): anywhere down its column while the farm tiles under it are empty (they
+-- may fall), down to your floor row.
 function fb.tileDrops(t)
+	if t.stack then
+		local b = t.below
+		if dropsIn(t.x, t.y) then return true end
+		if b then return not tileState(b) and fb.tileDrops(b) or false end
+		return dropsIn(t.x, t.y + 1) or false
+	end
 	return dropsIn(t.x, t.y) or (t.under and dropsIn(t.x, t.y + 1)) or false
 end
 
@@ -2351,7 +2513,7 @@ local function collectTile(first)
 		end
 	end
 	local t, n = first, 0
-	while t and n < 6 and state.AutoFarm and not fb.farmCheckOpen do
+	while t and n < 6 and state.AutoFarm and not fb.farmCheckOpen and not fb.farmDropDue do
 		n += 1
 		t.collecting = true
 		local off = t.x + 0.5 - a.x
@@ -2359,7 +2521,26 @@ local function collectTile(first)
 		local tt = t
 		local gone = function() return not fb.tileDrops(tt) end
 		fb.farmStatus = "picking up"
-		if t.head and mid then
+		if t.stack then
+			-- 6 / 10 on top: under its column on the floor row, jump on the way in; held while the drops
+			-- are still there (a held jump rises ~3.6 tiles, a tap ~1.4), let go once they're taken. The
+			-- farm tile under it stays empty meanwhile (collecting): nothing gets built into the jump.
+			local b = t.below
+			if b then b.collecting = true end
+			local tx, jt = t.x + 0.5, nil
+			stepToX(tx, 2.5, function(dt)
+				return gone() or (jt ~= nil and dt - jt > 0.2 and fb.player.state().grounded)
+			end, function(dt)
+				if not jt and math.abs(fb.player.state().x - tx) < 0.18 then jt = dt end
+				return jt ~= nil and (dt - jt < 0.08 or (fb.player.state().vy < 0 and not gone()))
+			end)
+			if b then b.collecting = nil end
+		elseif t.below then -- Line 5 outer: walk through the (empty) inner tile onto it
+			local b = t.below
+			b.collecting = true
+			stepOn(t.x + 0.5, gone)
+			b.collecting = nil
+		elseif t.head and mid then
 			-- jumps beside / onto the middle column: keep the middle empty until you're back down
 			if not tileState(mid) then
 				mid.collecting = true
@@ -2380,6 +2561,8 @@ local function collectTile(first)
 		elseif side ~= 0 then
 			local floor = fb.player.solidAt(t.x, t.y + 1)
 			stepOn(a.x + side * (floor and 1 or 0.75), gone)
+		elseif t.self then -- Box, your own tile: the drops are at your feet, the touch pickup takes them
+			stepToX(a.x, 0.6, gone)
 		else -- above your head: hop as you get back under it
 			hopAt(a.x, gone)
 		end
@@ -2400,7 +2583,8 @@ end
 function fb.farmReady(px)
 	local mid, best, bd = fb.farmMid, nil, nil
 	for _, o in ipairs(fb.farmTiles or {}) do
-		if not o.collecting and not tileState(o) and fb.tileDrops(o) and not (o.head and mid and tileState(mid)) then
+		if not o.collecting and not tileState(o) and fb.tileDrops(o) and not (o.head and mid and tileState(mid))
+			and not (o.below and tileState(o.below)) then -- 6 / 10 on top: no jumping through a block
 			local d = px and math.abs(o.x + 0.5 - px) or 0
 			if not bd or d < bd then best, bd = o, d end
 		end
@@ -2410,10 +2594,13 @@ end
 -- Start the pickup thread for tile t (one at a time; it takes the others' drops too).
 function fb.farmCollect(t)
 	if fb.collectT or t.collecting then return false end
+	if fb.farmDropDue then return false end -- drop / ATM trip due: go now, the drops wait on their tiles
 	if t.head and fb.farmMid and tileState(fb.farmMid) then return false end -- waits for the middle to be broken
+	if t.below and tileState(t.below) then return false end -- 6 / 10 on top: no jumping through a block
 	fb.collectT, t.collecting = t, true
 	task.spawn(function()
 		pcall(collectTile, t)
+		fb.farmActAt = os.clock() -- pickups are work too (rot.farm's stall guard)
 		for _, o in ipairs(fb.farmTiles) do o.collecting = nil end
 		fb.collectT = nil
 		if fb.farmStatus == "picking up" then fb.farmStatus = nil end -- don't leave it up while waiting on something else
@@ -2473,15 +2660,30 @@ local function tryPlace(t)
 		-- Usually the per-frame watcher below has started it already.
 		return fb.farmCollect(t)
 	end
+	if t.below or t.above then -- (Line 5 outer / inner: same rule, sideways)
+		-- 6 / 10 on top, per column: 1st row, then the 2nd on top of it; break the 1st, then the 2nd
+		-- (tryBreak); the 1st is refilled only once the 2nd is broken and its drops are taken (they
+		-- fall into / are jumped for through the 1st's tile).
+		local a, b = t.above, t.below
+		if b and not tileState(b) then return false end
+		if a and (tileState(a) or a.collecting or fb.tileDrops(a) or os.clock() - (a.brokeAt or 0) < (a.dropWait or DROP_WAIT)) then
+			return false
+		end
+	end
 	-- none yet: they may still be on the way (~ping) before we build over the spot
 	if os.clock() - (t.brokeAt or 0) < (t.dropWait or DROP_WAIT) then return false end
 	-- the real client never builds into your own body; the server checks it against your last
 	-- `move` (fb.pos), which trails a step back by up to a packet. Seen in it = place a beat after
 	-- the last time (the move packet is unreliable, the place reliable: no order between them).
-	for _, p in ipairs({ fb.player.state(), fb.pos }) do
-		if p and p.x + 0.3 > t.x and p.x - 0.3 < t.x + 1 and p.y > t.y and p.y - 0.95 < t.y + 1 then
-			t.placeAfter = os.clock() + 0.15
-			return false
+	if t.self then -- Box, your own tile: you stand in it, so only a block you can stand in
+		local it = farmBlock() and itemDB[farmBlock()]
+		if not (it and (it.background or not it.solid)) then return false end
+	else
+		for _, p in ipairs({ fb.player.state(), fb.pos }) do
+			if p and p.x + 0.3 > t.x and p.x - 0.3 < t.x + 1 and p.y > t.y and p.y - 0.95 < t.y + 1 then
+				t.placeAfter = os.clock() + 0.15
+				return false
+			end
 		end
 	end
 	local pick = farmBlock()
@@ -2499,7 +2701,8 @@ local function tryPlace(t)
 	local sd = seedOf(pick)
 	if sd then fb.farmSeeds[sd] = true end
 	placeTile(pl, t.x, t.y, pick)
-	t.placedAt, t.settle = os.clock(), human.gap(SETTLE) -- humanizer: place -> first hit isn't a constant
+	t.placedAt, t.settle = os.clock(), human.gap(fb.lim("settle", SETTLE)) -- humanizer: place -> first hit isn't a constant
+	fb.farmActAt = t.placedAt
 	if fb.world[pl][t.y][t.x] ~= pick then -- local replay didn't take: stop before we drain the bag
 		fb.farmStatus = "place didn't show · stopped"
 		state.AutoFarm = false
@@ -2512,6 +2715,7 @@ end
 local function tryBreak(t)
 	local layer, id = tileState(t)
 	if not layer then return false end
+	if t.below and tileState(t.below) then return false end -- 6 / 10 on top: the row under it goes first
 	if id ~= t.mine then -- not ours (someone built here): leave it
 		fb.farmStatus = "tile taken"
 		return false
@@ -2535,6 +2739,7 @@ local function tryBreak(t)
 	if broke then
 		t.placed, t.brokeAt, t.dropWait = false, os.clock(), human.gap(DROP_WAIT) -- break -> refill too
 		fb.farmBroken += 1
+		fb.farmActAt = t.brokeAt
 		fb.farmRejectRun = 0
 		human.cycle(0.1)
 		if human.drift() then fb.hitAt = (fb.hitAt or 0) + human.gap(HIT_GAP) end -- whiff: a swing slot lost
@@ -2549,7 +2754,7 @@ local function tripNeeded()
 	if fb.atmDue then return { atm = true } end -- Auto Rotate buys a City Pack: empty the tiles, then stop
 	if state.FarmDrop then
 		for sd in pairs(fb.farmSeeds) do
-			if fb.inv:count(sd) >= 200 then return { drop = sd } end
+			if fb.inv:count(sd) >= (fb.dropAt or 200) then return { drop = sd } end -- dropAt: speed tests drop early
 		end
 	end
 	local want = fb.farmPick or fb.farmLast
@@ -2569,11 +2774,17 @@ local function farmStep()
 			task.wait(0.2)
 			return
 		end
-		if math.abs(s.x - fb.farmAnchor.x) > 0.06 then stepToX(fb.farmAnchor.x, 1.5) return end -- center first
+		if math.abs(s.x - fb.farmAnchor.x) > 0.06 then -- center first
+			fb.farmStatus = "centering on the farm tile"
+			stepToX(fb.farmAnchor.x, 1.5)
+			return
+		end
+		if fb.farmStatus == "centering on the farm tile" then fb.farmStatus = nil end
 	end
 	-- Trip due: stop refilling and leave once our blocks are broken (they'd box you in).
 	local trip = tripNeeded()
 	fb.farmDrain = trip ~= nil
+	fb.farmDropDue = trip ~= nil and not trip.fetch or nil -- fetch: the tiles' block drops are what it's after
 	if trip and not fb.collectT and os.clock() >= fb.tripRetryAt then
 		local busy = false
 		for _, t in ipairs(fb.farmTiles) do
@@ -2586,7 +2797,9 @@ local function farmStep()
 				fb.toggleSet.AutoFarm(false)
 				return
 			end
+			fb.farmActAt = os.clock() -- a trip is work: the stall guard (rot.farm) counts from its end
 			farmTrip(trip)
+			fb.farmActAt = os.clock()
 			return
 		end
 	end
@@ -2903,7 +3116,8 @@ end
 -- Worn item with doubleJump (wings) = one air jump; doubleJump == true wings or a slowFall
 -- item also clamp your fall to 2.5 while jump is held (Game.lua physics step).
 local function wingsInfo()
-	local ok, worn = pcall(function() return debug.getupvalues(fb.avatar.buildRange)[1] end)
+	local worn = fb.wornList()
+	local ok = worn ~= nil
 	local wings
 	for _, id in pairs(ok and type(worn) == "table" and worn or {}) do
 		local it = itemDB[id]
@@ -3020,6 +3234,13 @@ function fb.findAvatar()
 	return fb.avatar
 end
 fb.findAvatar()
+-- Your worn table (slot -> id). Up to v1860 it was buildRange's 1st upvalue; since the game was split
+-- into modules (seen v2093) buildRange closes over the game's main table G, and the list is G.worn.
+function fb.wornList()
+	local ok, up = pcall(function() return debug.getupvalues(fb.avatar.buildRange)[1] end)
+	if not (ok and type(up) == "table") then return nil end
+	return type(rawget(up, "worn")) == "table" and up.worn or up
+end
 
 -- Route dots on the map (tile layer pans/zooms with the world).
 local pathDots = tilesLayer:FindFirstChild("PathDots") or Instance.new("Folder")
@@ -3052,10 +3273,9 @@ local function botStop(msg)
 	pathDots:ClearAllChildren()
 end
 
--- Leave like the menu's Exit button: WorldMenu.openPicker() = leave() (LeaveWorld + reset
--- other players) and opens the world picker, so the UI stays consistent.
--- Found at load: the bot runs inside the game's own physics thread (identity 2), where
--- getgc doesn't see the WorldMenu table.
+-- The game's WorldMenu table (openPicker / enter / enterFailed): only its enterFailed is still used
+-- (the game calls it when a teleport can't start; Auto Rotate hooks it). Found at load: the bot runs
+-- inside the game's own physics thread (identity 2), where getgc doesn't see it.
 local function findWorldMenu()
 	for _, t in pairs(getgc(true)) do
 		if type(t) == "table" and type(rawget(t, "openPicker")) == "function" and type(rawget(t, "enterFailed")) == "function" then
@@ -3064,16 +3284,57 @@ local function findWorldMenu()
 	end
 end
 fb.worldMenu = findWorldMenu() or fb.worldMenu
+-- Every world change goes like the game's /warp chat command (user, 11-19: tested by hand, works):
+-- world.enter(name) straight from the world you're in = menuApi.enter, the game's enterWorld, the same
+-- call the picker's Enter World makes. Never Exit: since v2093 Exit (LeaveWorld) ends in the Selection
+-- lobby place, where this script doesn't run. Returns the game's (ok, message, teleport); teleport = the
+-- world is on another server and the game is moving you there (this run ends, autoexec starts the next).
+function fb.warp(name)
+	local m = fb.findMenuApi and fb.findMenuApi()
+	if not (m and type(m.enter) == "function") then return false, "menu API not found" end
+	local ok, a, b, c = pcall(m.enter, name)
+	if not ok then return false, tostring(a) end
+	return a, b, c
+end
+-- The game's main table G (v2093: the treeChanged listener's upvalues are Net + G; G has exitWorld).
+function fb.findG()
+	if fb.mainG then return fb.mainG end
+	pcall(function()
+		for _, h in pairs(net.treeChanged.getListeners()) do
+			for _, u in ipairs(debug.getupvalues(h)) do
+				if type(u) == "table" and type(rawget(u, "exitWorld")) == "function" then fb.mainG = u return end
+			end
+		end
+	end)
+	return fb.mainG
+end
+fb.mainG = nil -- a re-run looks again
+fb.findG()
+-- WorldClosed: the game's handler runs exitWorld (G.exiting = a 0.45 s zoom-out read every frame), and
+-- at its end Teleport(PlaceId) = the Selection lobby (v2093), where this script doesn't run. When we're
+-- going back in, call that exit off and /warp instead. The world is gone server-side, so its fg grid is
+-- marked closed (rot.inWorld = false) until a world is applied again (a new grid).
+function fb.holdExit()
+	fb.closedFg = fb.world and fb.world.fg
+	local G = fb.findG()
+	if not G then return false end
+	local function cancel()
+		local ex = rawget(G, "exiting")
+		if type(ex) ~= "table" then return end
+		G.exiting = nil
+		if ex.zoomFrom then G.zoom, G.zoomTarget = ex.zoomFrom, ex.zoomFrom end -- what the exit's end does
+	end
+	cancel()
+	task.defer(cancel) -- in case the game's own WorldClosed listener runs after ours
+	return true
+end
+-- "Leave the world" (Path's leave after get, Stranger guard) = /warp to your storage world
+-- (fb.leaveTo, from Auto Rotate's settings), else START.
 local function leaveWorld()
-	if not fb.worldMenu and setthreadidentity then
-		setthreadidentity(8)
-		fb.worldMenu = findWorldMenu()
-	end
-	if fb.worldMenu then
-		fb.worldMenu.openPicker()
-	else
-		net.call("LeaveWorld") -- fallback: leaves, but the picker won't open
-	end
+	local here = fb.world and fb.world.name
+	local to = fb.leaveTo and fb.leaveTo()
+	if type(to) ~= "string" or to == "" or to == here then to = "START" end
+	if to ~= here then fb.warp(to) end
 end
 
 -- Plan from where you stand. No route yet = "wait" (stay armed, don't move) instead of
@@ -3434,8 +3695,10 @@ end
 -- Returns error or nil, + how many items were dropped.
 -- mix: ids allowed to share a pile tile (default ids), e.g. Auto Harvest's block + seed.
 -- Wait out the game's own drop cooldown ("Slow down!"): onDrop's upvalue table holds DROP_COOLDOWN
--- (1s on v1860, was ~0.3) and lastDropAt (os.clock). Not found = 1.2s. + a human beat.
+-- (1s on v1860, was ~0.3) and lastDropAt (os.clock); since v2093 both sit on the world table.
+-- Not found = 1.2s. + a human beat.
 function fb.dropGap()
+	if not fb.dropCD and fb.world and rawget(fb.world, "DROP_COOLDOWN") then fb.dropCD = fb.world end
 	if not fb.dropCD and fb.avatar and fb.avatar.onDrop then
 		for _, u in ipairs(debug.getupvalues(fb.avatar.onDrop)) do
 			if type(u) == "table" and rawget(u, "DROP_COOLDOWN") and rawget(u, "lastDropAt") then fb.dropCD = u break end
@@ -5238,7 +5501,7 @@ end
 makeSection(pathPage, "Walk to a drop", 1)
 local pathLabel = makeInfoCard(pathPage, "Status", 2)
 makeButton(pathPage, "Stop", 3, function() if bot then botStop("stopped") end end)
-makeToggle(pathPage, "Auto leave after get", "Exit the world once you pick the drop up", 4, "PathLeave")
+makeToggle(pathPage, "Auto leave after get", "Once you pick the drop up: /warp to your storage world (none set: START)", 4, "PathLeave")
 makeSection(pathPage, "Drops nearby (click to go)", 7)
 local dropGrid = Instance.new("Frame")
 dropGrid.Size = UDim2.new(1, 0, 0, 0)
@@ -5317,7 +5580,7 @@ do
 				and "farming check · yours to answer"
 			or (low:find("kick") or low:find("%f[%a]ban")) and "kicked / banned"
 			or #fb.rejoins >= 3 and "closed 3 times in 10 min"
-			or not (fb.worldMenu and fb.worldMenu.enter) and "world menu not found"
+			or not fb.findMenuApi() and "menu API not found"
 			or nil
 	end
 	fb.rjNo = rj.no
@@ -5329,32 +5592,28 @@ do
 		if no then return rj.say(on, "world closed" .. tag .. " · not rejoining: " .. no) end
 		table.insert(fb.rejoins, now)
 		rj.say(on, "world closed" .. tag .. " · rejoining " .. name)
-		task.wait(human.range({ 3, 6 })) -- the picker opens after the zoom and leaves: entering before that gets undone
+		task.wait(human.range({ 3, 6 })) -- a player's beat (the game's exit to the lobby is called off: fb.holdExit)
 		if fb.gen ~= myGen or fb.farmCheckOpen then return end
-		if fb.hookEnter then fb.hookEnter() end -- fb.enterRes / fb.enterFail (Auto Rotate's hook)
+		if fb.hookEnter then fb.hookEnter() end -- fb.enterFail (Auto Rotate's hook on the game's enterFailed)
 		-- The world may be on another server: the game teleports you ("Entering X...") and this script
 		-- ends; the autoexec run over there switches the modes back on (rj.FILE, see below).
 		pcall(writefile, rj.FILE, game:GetService("HttpService"):JSONEncode({ world = name, modes = on, at = os.time() }))
 		local entered, why
 		for try = 1, 3 do
 			local fg0, t0 = fb.world.fg, os.clock()
-			fb.enterRes, fb.enterFail = nil, nil
-			fb.worldMenu.enter(name) -- = typing the name + Enter World; the game's applyWorld swaps in a new fg grid
-			local r = fb.enterRes
-			if r and r.teleport then
-				-- a teleport that never comes (seen 11-17, stuck on "Entering JNMA..."): give it 2 min,
-				-- then the game's own enterFailed, which also frees the picker for the next try
+			fb.enterFail = nil
+			local okE, msg, tp = fb.warp(name) -- /warp; the game's applyWorld swaps in a new fg grid
+			if tp then
+				-- a teleport that never comes (seen 11-17, stuck on "Entering JNMA..."): give it 2 min
 				rj.say(on, "rejoining " .. name .. " · teleporting (it's on another server)")
 				while not fb.enterFail and os.clock() - t0 < 120 do task.wait(0.5) end
-				if not fb.enterFail then fb.worldMenu.enterFailed("Couldn't reach that world, try again.") end
-			elseif not r then
-				fb.worldMenu.enterFailed("") -- the picker was still busy (an earlier "Entering...")
-			else
+				fb.enterFail = fb.enterFail or "Couldn't reach that world, try again."
+			elseif okE then
 				while fb.world.fg == fg0 and os.clock() - t0 < 15 do task.wait(0.25) end
 			end
 			entered = fb.world.fg ~= fg0 and fb.world.name == name
 			if entered or fb.gen ~= myGen then break end
-			why = fb.enterFail ~= nil and fb.enterFail ~= "" and fb.enterFail or r and r.msg or "the picker was busy"
+			why = fb.enterFail and fb.enterFail ~= "" and fb.enterFail or msg or "no answer"
 			rj.say(on, string.format("couldn't get back into %s (%s) · try %d of 3", name, tostring(why), try))
 			task.wait(human.range({ 10, 20 }) * try)
 		end
@@ -5383,12 +5642,20 @@ do
 	end
 	pcall(net.on, "WorldClosed", function(why)
 		if fb.gen ~= myGen then return end
-		if (state.AutoRotate or state.AutoDrop) and fb.rotClosed then task.spawn(fb.rotClosed, tostring(why or "")) return end
+		why = tostring(why or "")
 		local name, on = fb.world and fb.world.name, {}
 		for _, k in ipairs(rj.MODES) do
 			if state[k] then on[#on + 1] = k end
 		end
-		if #on > 0 and name and name ~= "" then task.spawn(rj.run, name, tostring(why or ""), on) end
+		local rotating = (state.AutoRotate or state.AutoDrop) and fb.rotClosed
+		-- going back in (same rules as rj.run / fb.rotClosed): stop the game's exit to the lobby, /warp later.
+		-- Not going back (kick / ban / farm check ...) = the game's own exit to the lobby, as before.
+		if rotating or (#on > 0 and name and name ~= "") then
+			local no = rj.no(why)
+			if not no or (rotating and no == "you left") then fb.holdExit() end
+		end
+		if rotating then task.spawn(fb.rotClosed, why) return end
+		if #on > 0 and name and name ~= "" then task.spawn(rj.run, name, why, on) end
 	end, function() return fb.world and fb.world.name or "" end)
 	-- This run started after rj.run's teleport (the world was on another server): once you're in that
 	-- world, switch its modes back on. Auto Farm stays off: its tiles are the ones around where you
@@ -5437,7 +5704,7 @@ do
 	-- one settings file per account: 2 clients on one PC share the workspace folder
 	local rot = { FILE = "growblox_auto_" .. players.LocalPlayer.Name .. ".json", FRESH = 900, page = pages.Rotate, bad = {}, loading = true,
 		COOL = { { 60, 120 }, { 180, 300 }, { 300, 480 } }, -- s of cool-down after the 1st / 2nd / 3rd reject stop in 30 min
-		SETTINGS = { "FastBreak", "BreakWalk", "FarmFetch", "FarmDrop", "RowFetch", "RowDrop", "RotRow", "PathLeave", "Humanize", "HumanPauses", "PlantBurst", "DoorHover", "DoorTags", "UltimateFPS", "BlankScreen", "AntiIdle", "DropWall", "NoDrop", "Guard", "FarmTop", "AutoATM", "IdleQuit" },
+		SETTINGS = { "FastBreak", "BreakWalk", "FarmFetch", "FarmDrop", "RowFetch", "RowDrop", "RotRow", "PathLeave", "Humanize", "HumanPauses", "PlantBurst", "DoorHover", "DoorTags", "UltimateFPS", "BlankScreen", "AntiIdle", "DropWall", "NoDrop", "Guard", "FarmTop", "FarmTop6", "FarmTop10", "FarmBox", "FarmLine", "FarmLine5", "FarmSelf", "FarmPair", "FarmSafe", "FarmL1", "FarmL125", "FarmL15", "FarmL175", "FarmL2", "AutoATM", "IdleQuit" },
 		MODES = { "AutoBreak", "AutoCollect", "AutoFarm", "AutoHarvest", "AutoPlant", "RowFarm" } } -- RowFarm: only switched off (Rotate drives the bot)
 	local cfg = (function()
 		local ok, c = pcall(function() return game:GetService("HttpService"):JSONDecode(readfile(rot.FILE)) end)
@@ -5463,6 +5730,7 @@ do
 		pcall(function() writefile(rot.FILE, game:GetService("HttpService"):JSONEncode(cfg)) end)
 	end
 	fb.saveCfg = rot.save
+	fb.leaveTo = function() return cfg.storage end -- leaveWorld's /warp target (your storage world)
 	function rot.per(name) -- per world: seed, ready (server time), farm {x, y}, spot (storage drop)
 		cfg.per[name] = cfg.per[name] or {}
 		return cfg.per[name]
@@ -5489,6 +5757,7 @@ do
 		end
 		cfg.run.phase, cfg.run.world, cfg.run.pin = phase, world or cfg.run.world, nil
 		rot.ran, rot.moved, rot.doneAt, rot.spotFails, rot.bad, rot.retries, rot.hvLeft = nil, 0, nil, 0, {}, 0, nil
+		rot.stalls = 0
 		rot.save()
 		rot.log("phase", tostring(phase) .. " " .. tostring(cfg.run.world))
 	end
@@ -5547,6 +5816,7 @@ do
 		local mg = playerGui:FindFirstChild("MenuGui")
 		local wp = mg and mg:FindFirstChild("WorldPicker")
 		return fb.world ~= nil and (fb.world.name or "") ~= "" and not (wp and wp.Visible)
+			and (fb.closedFg == nil or fb.world.fg ~= fb.closedFg) -- a world closed on you (fb.holdExit) is left
 	end
 	function rot.refind()
 		fb.world, fb.drops = findWorld() or fb.world, findDrops() or fb.drops
@@ -5591,7 +5861,7 @@ do
 		end
 	end
 	fb.hookEnter = rot.hookEnter -- the world-closed rejoin (above rot) uses it too
-	-- Leave like the menu's Exit (WorldMenu.openPicker), enter like typing the name + Enter World.
+	-- Enter like /warp (straight from the world you're in; before v2093: Exit first, then the picker).
 	-- Same server: the world loads in place right away (applyWorld swaps in a new fg grid). Another
 	-- server: the game says "Entering X..." and teleports you; that ends this script and the
 	-- autoexec loader starts it over there. A teleport that fails (or never comes, 2 min) = the
@@ -5604,26 +5874,20 @@ do
 		if not rot.on() or fb.farmCheckOpen or (state.AutoRotate and cfg.run.force and name ~= cfg.run.world and name ~= cfg.storage) then return end
 		rot.hookEnter()
 		local from = rot.inWorld() and fb.world.name or "picker"
-		if from ~= "picker" then
-			fb.worldMenu.openPicker()
-			task.wait(human.range({ 2, 4 }))
-			if state.AutoRotate and cfg.run.force and name ~= cfg.run.world and name ~= cfg.storage then return end -- you clicked another world: this trip's off
-		end
 		local fg0, t0 = fb.world.fg, os.clock()
-		fb.enterRes, fb.enterFail = nil, nil
-		fb.worldMenu.enter(name)
-		local r = fb.enterRes
-		if not r then -- the picker was still busy (an earlier "Entering..."): free it, try again
-			fb.worldMenu.enterFailed("")
-		elseif r.teleport then
+		fb.enterFail = nil
+		local okE, msg, tp = fb.warp(name) -- /warp, straight from this world (no Exit)
+		local r = { ok = okE, msg = msg, teleport = tp }
+		if r.teleport then
 			rot.say("teleporting to " .. name .. " (it's on another server)")
 			rot.log("teleport", from .. " -> " .. name)
 			rot.save()
+			-- a teleport that never comes (seen 11-17): 2 min, then count it as failed
 			while not fb.enterFail and os.clock() - t0 < 120 do task.wait(0.5) end
-			if not fb.enterFail then fb.worldMenu.enterFailed("Couldn't reach that world, try again.") end
+			fb.enterFail = fb.enterFail or "Couldn't reach that world, try again."
 		end
 		if fb.world.fg == fg0 or fb.world.name ~= name then
-			local why = fb.enterFail ~= "" and fb.enterFail or r and r.msg or "the picker was busy"
+			local why = fb.enterFail and fb.enterFail ~= "" and fb.enterFail or r.msg or "no answer"
 			rot.log("enter failed", name .. ": " .. tostring(why))
 			rot.fails = (rot.fails or 0) + 1
 			if rot.fails >= 3 then return rot.stop("couldn't enter " .. name .. ": " .. tostring(why)) end
@@ -5705,17 +5969,31 @@ do
 		end
 		local function score(x, y)
 			if rot.bad[x .. "," .. y] or not standable(x, y) then return nil end
-			if state.FarmTop and not free(x, y - 1) then return nil end -- "3 on top" needs the middle (Auto Farm)
+			local layout, stacked, half = fb.topLayout()
+			if layout and not fb.rowOnly() and not free(x, y - 1) then return nil end
+			if state.FarmLine5 then -- the outer tiles are walked to: floor under all 4 side tiles
+				for _, dx in ipairs({ -2, -1, 1, 2 }) do
+					if not solid(x + dx, y + 1) then return nil end
+				end
+			end -- "N on top" needs the middle (Auto Farm)
+			if stacked then -- 6 / 10: every column is walked under (open floor row beside you)
+				for dx = -half, half do
+					if dx ~= 0 and not standable(x + dx, y) then return nil end
+				end
+			end
 			local n, trees = 0, 0
-			local around = state.FarmTop and { { x - 1, y - 1 }, { x, y - 1 }, { x + 1, y - 1 } } -- "3 on top"
-				or { { x - 1, y }, { x + 1, y }, { x, y - 1 } }
+			local around = { { x - 1, y }, { x + 1, y }, { x, y - 1 } }
+			if layout then
+				around = {}
+				for i, o in ipairs(layout) do around[i] = { x + o[1], y + o[2] } end
+			end
 			for _, p in ipairs(around) do
 				if free(p[1], p[2]) then
 					n += 1
 					if spots[p[2] * w.w + p[1]] then trees += 1 end
 				end
 			end
-			return n >= 2 and (3 - n) * 6 + trees * 3 or nil
+			return n >= math.ceil(#around * 2 / 3) and (#around - n) * 6 + trees * 3 or nil
 		end
 		local h = P.farm
 		if h and h.manual then return standable(h.x, h.y) and h or nil end -- yours (Rotate page): as is
@@ -5758,10 +6036,15 @@ do
 		fb.fetching = nil
 		if fb.inv:count(d.id) == n0 and table.find(fb.drops, d) then fb.dropSkip[d.uid] = os.clock() + 30 end
 	end
-	-- d is the content of a display box you own (only the owner can take it out)
+	-- d is the content of a display box you can take it out of. The game's vendOwner is only staff /
+	-- the lock's owner; 11-18 boxes under a lock you're on the access list of (or no lock) weren't
+	-- seen, though taking works there: areas.canEdit (lock holder / rank / access) too.
 	function rot.ownBox(d)
 		local w = fb.world
-		return d.display ~= nil and w ~= nil and w.vendOwner ~= nil and select(2, pcall(w.vendOwner, d.display.x, d.display.y)) == true
+		if not (d.display ~= nil and w ~= nil) then return false end
+		local x, y = d.display.x, d.display.y
+		if w.vendOwner and select(2, pcall(w.vendOwner, x, y)) == true then return true end
+		return w.areas ~= nil and w.areas.canEdit ~= nil and select(2, pcall(w.areas.canEdit, x, y)) == true
 	end
 	-- any drop of id here, skipped or not; boxes: + your own display boxes holding it (Auto Drop)
 	function rot.anyPile(id, boxes)
@@ -5871,7 +6154,8 @@ do
 		cfg.run.quit = true
 		rot.save()
 		rot.left = true -- also tells the kick handler (resume block) this kick is ours
-		pcall(leaveWorld)
+		-- no Exit first (v2093): Exit sends you to the Selection lobby, which would end this script before
+		-- the kick and rot.rejoin. The disconnect takes you out of the world anyway.
 		task.wait(human.range({ 2, 4 }))
 		local back = os.clock() + secs - 3 -- os.clock: no device clock drift
 		players.LocalPlayer:Kick(string.format("Auto Rotate: nothing ripe · back by itself in %s", rot.fmt(secs)))
@@ -5993,6 +6277,27 @@ do
 		end
 		return rot.set("plant")
 	end
+	-- What Auto Farm was waiting on (rot.farm's stall guard, for the log)
+	function rot.farmWhy(block)
+		local ok, out = pcall(function()
+			local s, a, now = fb.player.state(), fb.farmAnchor or { x = 0, y = 0 }, os.clock()
+			local pile = nearestPile(block)
+			local parts = {
+				string.format("at %.2f,%.2f anchor %.2f,%.2f", s.x, s.y, a.x, a.y),
+				"bag block " .. tostring(farmBlock()) .. " pile " .. (pile and string.format("%d×%d @%.0f,%.0f", pile.id, pile.n, pile.x, pile.y) or "-"),
+				string.format("collectT %s drain %s retry %.0fs atm %s bot %s path %s idle %s", tostring(fb.collectT ~= nil), tostring(fb.farmDrain),
+					(fb.tripRetryAt or 0) - now, tostring(fb.atmDue), tostring(fb.botInput ~= nil), tostring(fb.pathStatus), tostring(human.status)),
+			}
+			for _, t in ipairs(fb.farmTiles or {}) do
+				local layer, id = tileState(t)
+				parts[#parts + 1] = string.format("%d,%d %s%s%s%s%s", t.x, t.y, tostring(layer or "empty"), id and (":" .. id) or "",
+					t.collecting and " collecting" or "", fb.tileDrops(t) and " drops" or "",
+					os.clock() < (t.placeAfter or 0) and " placeAfter" or "")
+			end
+			return table.concat(parts, " | ")
+		end)
+		return ok and out or ("? " .. tostring(out))
+	end
 	function rot.farm(w)
 		local P = rot.per(w.name)
 		local block = P.block or (P.seed and seedOf(P.seed - 1) == P.seed and P.seed - 1) or nil -- P.block: picked on the Rotate page
@@ -6029,16 +6334,38 @@ do
 				if rot.moved > 3 then rot.stop("Auto Farm: moved off the farm tile 3 times") end
 				return
 			end
-			local busy = farmBlock() ~= nil or nearestPile(block) ~= nil
+			-- Blocks still to farm: the rotation's block in the bag (11-18: "no drops left, blocks still in
+			-- the bag, it went on to plant": only Auto Farm's own pick was counted), Auto Farm's pick, a
+			-- pile it can take now, or one of ours still on a farm tile.
+			local inBag = (block and fb.inv:count(block) > 0) or farmBlock() ~= nil
+			local busy = inBag or nearestPile(block) ~= nil
 			for _, t in ipairs(fb.farmTiles or {}) do
 				local layer, id = tileState(t)
 				if layer and id == t.mine then busy = true end
 			end
+			-- Stall guard (11-17, 4HH: "farm · running", standing still, work left; 11-18: the same with a
+			-- trip due, tiles empty): no place / break for 20 s with no status saying why = log what it was
+			-- waiting on, start the farm over (walk to the spot, toggle on). A stall never ends the phase
+			-- (11-18: 3 of them with the bag out of blocks and 400 dropped went on to plant): only "nothing
+			-- left" below does. Trips refresh farmActAt (a 25 s seed drop isn't standing still).
+			local st = fb.farmStatus
+			if busy and (st == nil or st == "centering on the farm tile" or st == "picking up") and not human.idle()
+				and os.clock() - (fb.farmActAt or os.clock()) > 20 then
+				rot.stalls = (rot.stalls or 0) + 1
+				rot.log("farm stall", string.format("%d · %s", rot.stalls, rot.farmWhy(block)))
+				fb.toggleSet.AutoFarm(false)
+				rot.ran = nil
+				rot.say("farm stood still 20s · starting it over")
+				return
+			end
+			-- piles skipped for a while after a missed pickup (dropSkip, 30 s) aren't "none left": wait
+			-- them out before calling it done
+			local wait = block and rot.anyPile(block) and 35 or 6
 			if busy then
 				rot.doneAt = nil
 			elseif not rot.doneAt then
 				rot.doneAt = os.clock()
-			elseif os.clock() - rot.doneAt > 6 then -- every block farmed (bag + dropped)
+			elseif os.clock() - rot.doneAt > wait then -- every block farmed (bag + dropped)
 				fb.toggleSet.AutoFarm(false)
 				return rot.farmDone(w)
 			end
@@ -6313,10 +6640,10 @@ do
 		if rot.on() then rot.restUntil, rot.restWhy, rot.ran = os.clock() + human.range(HUMAN.rest), nil, nil end
 	end
 	-- WorldClosed while rotating (from the rejoin listener): same rules as Rejoin, then the loop
-	-- goes back in (once the game's picker is up). A random world closing = just another one.
+	-- /warps back in (the closed world reads as left: fb.holdExit). A random world closing = just another one.
 	fb.rotClosed = function(why)
 		if setthreadidentity then pcall(setthreadidentity, 8) end
-		rot.holdUntil = os.clock() + 4 -- the game opens the picker (and leaves) ~0.5s after this
+		rot.holdUntil = os.clock() + 4 -- a player's beat before going back in
 		rot.log("world closed", (fb.world and fb.world.name or "?") .. ": " .. why)
 		rot.modesOff()
 		rot.ran = nil
@@ -6328,8 +6655,8 @@ do
 	end
 
 	-- Rotate page
-	makeSection(rot.page, "Auto Rotate", 1)
-	makeToggle(rot.page, "Auto Rotate", "Harvest → farm → plant → leftover seeds to storage → next world", 2, "AutoRotate", function(on)
+	makeSection(rot.page, "Auto Rotate", 0)
+	makeToggle(rot.page, "Auto Rotate", "Harvest → farm → plant → leftover seeds to storage → next world", 1, "AutoRotate", function(on)
 		if not on then
 			rot.modesOff()
 			rot.say("OFF")
@@ -6340,7 +6667,7 @@ do
 		rot.title = "Auto Rotate"
 		rot.refind()
 		fb.worldMenu = fb.worldMenu or findWorldMenu()
-		local miss = not fb.hookMobile() and "controls" or not (fb.worldMenu and fb.worldMenu.enter) and "world menu"
+		local miss = not fb.hookMobile() and "controls"
 			or not fb.findMenuApi() and "menu API" or not fb.hv and "harvest module" or nil
 		if miss then rot.say("game " .. miss .. " not found yet · try again") return false end
 		if not (fb.world and fb.player and fb.inv and fb.drops) then rot.say("enter any world first") return false end
@@ -6350,8 +6677,9 @@ do
 		rot.moved, rot.spotFails, rot.bad, rot.retries, rot.rejStops = 0, 0, {}, 0, nil -- you turned it on: reject strikes start over
 		rot.say("starting")
 	end)
-	rot.status = makeInfoCard(rot.page, "Status", 3)
-	rot.next = makeInfoCard(rot.page, "Next ripe", 4)
+	rot.status = makeInfoCard(rot.page, "Status", 2)
+	rot.next = makeInfoCard(rot.page, "Next ripe", 3)
+	rot.dropped = makeInfoCard(rot.page, "Dropped here · block / seed", 4)
 	makeSection(rot.page, "Phase (this world · click to switch)", 5)
 	rot.phaseGrid = fb.pl.grid(6, rot.page)
 	rot.phaseGrid:FindFirstChildOfClass("UIGridLayout").CellSize = UDim2.new(1 / 3, -6, 0, 34)
@@ -6438,6 +6766,19 @@ do
 				-- farm block pick for this world: Auto + blocks with a seed that are in the bag / dropped here
 				fb.pl.clear(rot.blockGrid)
 				local P = w and w.name ~= "" and table.find(cfg.worlds, w.name) and rot.per(w.name)
+				rot.dropped.Text = "-"
+				if P then -- this world's block + seed lying on the floor here (not in display boxes)
+					local block = P.block or (P.seed and seedOf(P.seed - 1) == P.seed and P.seed - 1) or nil
+					local seed = P.seed or (block and seedOf(block))
+					local nb, ns = 0, 0
+					for _, d in ipairs(fb.drops or {}) do
+						if d.uid and not (d.pending or d.display) then
+							if d.id == block then nb += d.n elseif d.id == seed then ns += d.n end
+						end
+					end
+					rot.dropped.Text = string.format("%s ×%d · %s ×%d", block and itemDB[block] and itemDB[block].name or "block", nb,
+						seed and itemDB[seed] and itemDB[seed].name or "seed", ns)
+				end
 				if P then
 					local n, ids = {}, {}
 					for _, sl in ipairs(fb.inv and fb.inv.slots or {}) do n[sl.id] = (n[sl.id] or 0) + sl.n end
@@ -6766,7 +7107,7 @@ do
 		if C.supply == "" or C.storage == "" or C.supply == C.storage then rot.say("set a supply and a storage world (two different ones)") return false end
 		rot.refind()
 		fb.worldMenu = fb.worldMenu or findWorldMenu()
-		local miss = not fb.hookMobile() and "controls" or not (fb.worldMenu and fb.worldMenu.enter) and "world menu"
+		local miss = not fb.hookMobile() and "controls"
 			or not fb.findMenuApi() and "menu API" or not fb.findAvatar() and "drop function" or nil
 		if miss then rot.say("game " .. miss .. " not found yet · try again") return false end
 		if not (fb.world and fb.player and fb.inv and fb.drops) then rot.say("enter any world first") return false end
