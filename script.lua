@@ -6169,7 +6169,9 @@ do
 		while fb.gen == myGen do
 			if os.clock() >= back then
 				rot.log("rejoin", "teleporting back in")
-				local ok, err = pcall(tp.Teleport, tp, game.PlaceId, players.LocalPlayer)
+				-- v2093: straight to the Selection lobby (a public main server sends you there anyway);
+				-- autoexec's lobby step enters a ripe farm world (run.quit)
+				local ok, err = pcall(tp.Teleport, tp, 113448687145837, players.LocalPlayer)
 				if not ok then rot.log("rejoin", "failed: " .. tostring(err)) end
 				task.wait(human.range({ 240, 360 }))
 			else
