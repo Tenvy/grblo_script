@@ -3334,7 +3334,13 @@ local function leaveWorld()
 	local here = fb.world and fb.world.name
 	local to = fb.leaveTo and fb.leaveTo()
 	if type(to) ~= "string" or to == "" or to == here then to = "START" end
-	if to ~= here then fb.warp(to) end
+	if to == here then return true, nil, to end
+	local ok, msg = fb.warp(to)
+	if not ok and to ~= "START" and here ~= "START" then -- storage refused / unreachable: START instead
+		to = "START"
+		ok, msg = fb.warp(to)
+	end
+	return ok, msg, to
 end
 
 -- Plan from where you stand. No route yet = "wait" (stay armed, don't move) instead of
@@ -6157,6 +6163,8 @@ do
 		-- no Exit first (v2093): Exit sends you to the Selection lobby, which would end this script before
 		-- the kick and rot.rejoin. The disconnect takes you out of the world anyway.
 		task.wait(human.range({ 2, 4 }))
+		-- ponytail: Delta (Redfinger, 11-20 log) ignores rot.rejoin's Teleport after the kick (no error, for
+		-- hours) = stays offline until you log in. Waiting online in the lobby instead was turned down.
 		local back = os.clock() + secs - 3 -- os.clock: no device clock drift
 		players.LocalPlayer:Kick(string.format("Auto Rotate: nothing ripe · back by itself in %s", rot.fmt(secs)))
 		task.spawn(rot.rejoin, back)
@@ -6166,12 +6174,22 @@ do
 	-- still here 4-6 min later = it failed, try again (a good one took ~3 min on 11-16).
 	function rot.rejoin(back)
 		local tp = game:GetService("TeleportService")
+		-- Delta (Redfinger, 11-20): every try below was silently ignored. Log Roblox's reason if it gives one,
+		-- and alternate lobby / main place to see if only one target is refused.
+		pcall(function()
+			tp.TeleportInitFailed:Connect(function(_, result, msg)
+				rot.log("rejoin", "refused: " .. tostring(result) .. " " .. tostring(msg))
+			end)
+		end)
+		local n = 0
 		while fb.gen == myGen do
 			if os.clock() >= back then
-				rot.log("rejoin", "teleporting back in")
-				-- v2093: straight to the Selection lobby (a public main server sends you there anyway);
-				-- autoexec's lobby step enters a ripe farm world (run.quit)
-				local ok, err = pcall(tp.Teleport, tp, 113448687145837, players.LocalPlayer)
+				n += 1
+				-- v2093: the Selection lobby (a public main server sends you there anyway); autoexec's lobby
+				-- step enters a ripe farm world (run.quit)
+				local to = n % 2 == 1 and 113448687145837 or game.PlaceId
+				rot.log("rejoin", "teleporting back in · " .. to .. " · " .. tostring(identifyexecutor and identifyexecutor() or "?"))
+				local ok, err = pcall(tp.Teleport, tp, to, players.LocalPlayer)
 				if not ok then rot.log("rejoin", "failed: " .. tostring(err)) end
 				task.wait(human.range({ 240, 360 }))
 			else
@@ -7225,7 +7243,28 @@ do
 		task.delay(20, function()
 			if fb.gen ~= myGen then return end
 			fb.leftAt = os.clock() -- Rejoin / Auto Rotate read it as "you left": they don't go back in
-			pcall(leaveWorld)
+			if setthreadidentity then pcall(setthreadidentity, 8) end
+			local w0 = fb.world
+			local name0, fg0 = w0 and w0.name, w0 and w0.fg
+			local function still() return fb.world and fb.world.name == name0 and fb.world.fg == fg0 end
+			-- a /warp that fails silently left you standing there (Redfinger/Delta, 11-20): log every try,
+			-- look for the menu API again (getgc misses on mobile), check you really moved
+			for try = 1, 3 do
+				if fb.gen ~= myGen or not still() then break end
+				if try > 1 then fb.menuApi = nil end
+				local okL, ok, msg, to = pcall(leaveWorld)
+				rot.log("guard", string.format("leave try %d → %s: %s", try, tostring(to),
+					okL and (ok and "ok" or tostring(msg or "refused")) or tostring(ok)))
+				local t0 = os.clock()
+				while okL and ok and still() and os.clock() - t0 < 15 do task.wait(0.5) end
+				if still() and try < 3 then task.wait(2) end
+			end
+			-- /warp didn't work at all: Exit (ends in the Selection lobby, the script stops there; still out)
+			if fb.gen == myGen and still() then
+				local G = fb.findG()
+				rot.log("guard", "warp failed 3x · exit to the lobby")
+				if G and type(G.exitWorld) == "function" then pcall(G.exitWorld) end
+			end
 			fb.modAt = nil
 		end)
 	end
@@ -7373,6 +7412,17 @@ do
 	makeToggle(rot.page, "Auto buy City Pack", "8,500 gems: buy it, drop its items in the storage world, back to farming", 29, "AutoATM")
 	makeSection(rot.page, "When nothing is ripe", 30)
 	makeToggle(rot.page, "Leave the game", "Nothing ripe for 15+ min: leave the game, join again by itself when a world is ripe (webhook says when)", 31, "IdleQuit")
+	-- Test of the leave + rejoin path alone (does this executor's Teleport work after a kick?): all off,
+	-- kick, rot.rejoin 10 s later. No run.quit = the lobby step does nothing, you land in Selection.
+	makeButton(rot.page, "Test: leave and reconnect (10s)", 32, function()
+		if fb.gen ~= myGen or rot.left then return end
+		rot.modesOff()
+		if state.AutoRotate and fb.toggleSet.AutoRotate then pcall(fb.toggleSet.AutoRotate, false) end
+		rot.left = true -- the kick handler: our own kick, not "kicked, won't resume"
+		rot.log("quit", "test · back in 10s")
+		players.LocalPlayer:Kick("Test: leave and reconnect · back in 10s")
+		task.spawn(rot.rejoin, os.clock() + 10)
+	end)
 
 	-- Settings from the last run (= clicking each switch), then Auto Rotate again if it was on in
 	-- the last 15 min (a teleport to another world's server, a re-run). Right after a teleport the
